@@ -238,6 +238,14 @@ pub enum TaprootAssetRuntimeEvent {
 		asset_id: [u8; TAPROOT_ASSET_ID_LEN],
 		total_amount: u64,
 	},
+	FundingAuxLeavesBound {
+		pending_channel_id: String,
+		funding_tapscript_root: String,
+		holder_commitment_to_counterparty_output_key: String,
+		counterparty_commitment_to_counterparty_output_key: String,
+		holder_commitment_to_counterparty_aux_leaf_script: String,
+		counterparty_commitment_to_counterparty_aux_leaf_script: String,
+	},
 	CommitmentAdvanced {
 		channel_id: String,
 		commitment_number: u64,
@@ -508,6 +516,10 @@ impl TaprootAssetManager {
 			.map_err(|err| TaprootAssetError::ChannelManager(format!("{err:?}")))?;
 		let (holder_commitment_to_counterparty, counterparty_commitment_to_counterparty) =
 			derive_initial_remote_owner_aux_leaves(&fields.outputs, &output_keys)?;
+		let holder_commitment_to_counterparty_aux_leaf_script =
+			hex_utils::to_string(holder_commitment_to_counterparty.as_bytes());
+		let counterparty_commitment_to_counterparty_aux_leaf_script =
+			hex_utils::to_string(counterparty_commitment_to_counterparty.as_bytes());
 		channel_manager
 			.set_pending_simple_taproot_commitment_aux_leaves(
 				ChannelId(fields.pending_channel_id),
@@ -517,7 +529,22 @@ impl TaprootAssetManager {
 				None,
 				Some(counterparty_commitment_to_counterparty),
 			)
-			.map_err(|err| TaprootAssetError::ChannelManager(format!("{err:?}")))
+			.map_err(|err| TaprootAssetError::ChannelManager(format!("{err:?}")))?;
+
+		let mut state = self.state.lock().expect("lock");
+		state.events.push(TaprootAssetRuntimeEvent::FundingAuxLeavesBound {
+			pending_channel_id: hex_utils::to_string(&fields.pending_channel_id),
+			funding_tapscript_root: hex_utils::to_string(&tapscript_root),
+			holder_commitment_to_counterparty_output_key: hex_utils::to_string(
+				&output_keys.holder_commitment_to_counterparty,
+			),
+			counterparty_commitment_to_counterparty_output_key: hex_utils::to_string(
+				&output_keys.counterparty_commitment_to_counterparty,
+			),
+			holder_commitment_to_counterparty_aux_leaf_script,
+			counterparty_commitment_to_counterparty_aux_leaf_script,
+		});
+		self.persist_locked(&state)
 	}
 
 	fn queue_message(
