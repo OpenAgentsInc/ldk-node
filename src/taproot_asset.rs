@@ -711,6 +711,17 @@ impl TaprootAssetManager {
 		features
 	}
 
+	pub(crate) fn custom_message_features(&self) -> InitFeatures {
+		let mut features = InitFeatures::empty();
+		if self.config.negotiate_simple_taproot_channels {
+			features.set_simple_taproot_staging_optional();
+		}
+		if self.config.negotiate_taproot_asset_channels {
+			features.set_taproot_asset_channel_optional();
+		}
+		features
+	}
+
 	fn persist_locked(&self, state: &TaprootAssetPersistedState) -> Result<(), TaprootAssetError> {
 		let raw = serde_json::to_vec(state).map_err(|_| TaprootAssetError::PersistenceFailed)?;
 		KVStoreSync::write(
@@ -890,6 +901,17 @@ mod tests {
 			)
 			.unwrap();
 		assert_eq!(manager.list_received_messages().len(), 1);
+	}
+
+	#[test]
+	fn advertised_custom_features_do_not_duplicate_base_channel_features() {
+		let manager = manager(true);
+		let features = manager.custom_message_features();
+
+		assert!(features.supports_simple_taproot_staging());
+		assert!(features.supports_taproot_asset_channel());
+		assert!(!features.supports_static_remote_key());
+		assert!(!features.supports_channel_type());
 	}
 
 	#[test]

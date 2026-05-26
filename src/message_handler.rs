@@ -139,7 +139,7 @@ where
 		} else {
 			InitFeatures::empty()
 		};
-		features |= self.taproot_asset_manager.local_features();
+		features |= self.taproot_asset_manager.custom_message_features();
 		features
 	}
 
