@@ -2011,7 +2011,15 @@ impl Node {
 
 			let is_persisted = stored_peer.is_some();
 			let is_connected = true;
-			let details = PeerDetails { node_id, address, is_persisted, is_connected };
+			let init_features = connected_peer.init_features;
+			let details = PeerDetails {
+				node_id,
+				address,
+				is_persisted,
+				is_connected,
+				supports_simple_taproot_staging: init_features.supports_simple_taproot_staging(),
+				supports_taproot_asset_channel: init_features.supports_taproot_asset_channel(),
+			};
 			peers.push(details);
 		}
 
@@ -2026,6 +2034,8 @@ impl Node {
 				address: p.address,
 				is_persisted: true,
 				is_connected: false,
+				supports_simple_taproot_staging: false,
+				supports_taproot_asset_channel: false,
 			};
 
 			peers.push(details);

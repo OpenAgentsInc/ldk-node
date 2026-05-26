@@ -678,6 +678,10 @@ pub struct PeerDetails {
 	pub is_persisted: bool,
 	/// Indicates whether we currently have an active connection with the peer.
 	pub is_connected: bool,
+	/// Indicates whether the connected peer advertised simple-taproot staging.
+	pub supports_simple_taproot_staging: bool,
+	/// Indicates whether the connected peer advertised Taproot Asset channels.
+	pub supports_taproot_asset_channel: bool,
 }
 
 /// Custom TLV entry.
