@@ -405,12 +405,31 @@ impl TaprootAssetManager {
 	pub(crate) fn handle_message(
 		&self, msg: TaprootAssetWireMessage, sender_node_id: PublicKey,
 	) -> Result<(), lightning::ln::msgs::LightningError> {
-		self.record_received_message(sender_node_id, msg).map_err(|err| {
+		self.record_received_message(sender_node_id, msg.clone()).map_err(|err| {
 			lightning::ln::msgs::LightningError {
 				err: err.to_string(),
 				action: lightning::ln::msgs::ErrorAction::IgnoreError,
 			}
-		})
+		})?;
+
+		if let Some(ack_payload) = funding_ack_for_output_proof(&msg).map_err(|err| {
+			lightning::ln::msgs::LightningError {
+				err: err.to_string(),
+				action: lightning::ln::msgs::ErrorAction::IgnoreError,
+			}
+		})? {
+			self.queue_message(
+				sender_node_id,
+				TaprootAssetMessageKind::AssetFundingAccepted,
+				ack_payload,
+			)
+			.map_err(|err| lightning::ln::msgs::LightningError {
+				err: err.to_string(),
+				action: lightning::ln::msgs::ErrorAction::IgnoreError,
+			})?;
+		}
+
+		Ok(())
 	}
 
 	pub(crate) fn get_and_clear_pending_messages(
@@ -791,6 +810,118 @@ fn parse_ldk_outpoint(value: &str) -> Result<LdkOutPoint, TaprootAssetError> {
 	})
 }
 
+fn funding_ack_for_output_proof(
+	msg: &TaprootAssetWireMessage,
+) -> Result<Option<Vec<u8>>, TaprootAssetError> {
+	if msg.kind != TaprootAssetMessageKind::TxAssetOutputProof {
+		return Ok(None);
+	}
+
+	let fields = parse_asset_output_proof_fields(&msg.payload)?;
+	if !fields.last {
+		return Ok(None);
+	}
+
+	Ok(Some(encode_asset_funding_ack(fields.pending_channel_id, true)))
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+struct AssetOutputProofFields {
+	pending_channel_id: [u8; TAPROOT_ASSET_ID_LEN],
+	last: bool,
+}
+
+fn parse_asset_output_proof_fields(
+	payload: &[u8],
+) -> Result<AssetOutputProofFields, TaprootAssetError> {
+	let mut offset = 0usize;
+	let mut pending_channel_id = None;
+	let mut last = None;
+
+	while offset < payload.len() {
+		let record_type = read_bigsize(payload, &mut offset)?;
+		let record_len = read_bigsize(payload, &mut offset)?;
+		if record_len > usize::MAX as u64 {
+			return Err(TaprootAssetError::DecodeFailed);
+		}
+		let record_len = record_len as usize;
+		let record_end = offset.checked_add(record_len).ok_or(TaprootAssetError::DecodeFailed)?;
+		if record_end > payload.len() {
+			return Err(TaprootAssetError::DecodeFailed);
+		}
+		let record_value = &payload[offset..record_end];
+		offset = record_end;
+
+		match record_type {
+			0 if record_value.len() == TAPROOT_ASSET_ID_LEN => {
+				let mut id = [0u8; TAPROOT_ASSET_ID_LEN];
+				id.copy_from_slice(record_value);
+				pending_channel_id = Some(id);
+			},
+			2 if record_value.len() == 1 => match record_value[0] {
+				0 => last = Some(false),
+				1 => last = Some(true),
+				_ => return Err(TaprootAssetError::DecodeFailed),
+			},
+			_ => {},
+		}
+	}
+
+	Ok(AssetOutputProofFields {
+		pending_channel_id: pending_channel_id.ok_or(TaprootAssetError::DecodeFailed)?,
+		last: last.unwrap_or(false),
+	})
+}
+
+fn encode_asset_funding_ack(
+	pending_channel_id: [u8; TAPROOT_ASSET_ID_LEN], accept: bool,
+) -> Vec<u8> {
+	let mut payload = Vec::with_capacity(37);
+	payload.push(0);
+	payload.push(TAPROOT_ASSET_ID_LEN as u8);
+	payload.extend_from_slice(&pending_channel_id);
+	payload.push(1);
+	payload.push(1);
+	payload.push(u8::from(accept));
+	payload
+}
+
+fn read_bigsize(payload: &[u8], offset: &mut usize) -> Result<u64, TaprootAssetError> {
+	let Some(first) = payload.get(*offset).copied() else {
+		return Err(TaprootAssetError::DecodeFailed);
+	};
+	*offset += 1;
+
+	match first {
+		0x00..=0xfc => Ok(first as u64),
+		0xfd => {
+			let bytes = read_fixed::<2>(payload, offset)?;
+			Ok(u16::from_be_bytes(bytes) as u64)
+		},
+		0xfe => {
+			let bytes = read_fixed::<4>(payload, offset)?;
+			Ok(u32::from_be_bytes(bytes) as u64)
+		},
+		0xff => {
+			let bytes = read_fixed::<8>(payload, offset)?;
+			Ok(u64::from_be_bytes(bytes))
+		},
+	}
+}
+
+fn read_fixed<const N: usize>(
+	payload: &[u8], offset: &mut usize,
+) -> Result<[u8; N], TaprootAssetError> {
+	let end = offset.checked_add(N).ok_or(TaprootAssetError::DecodeFailed)?;
+	if end > payload.len() {
+		return Err(TaprootAssetError::DecodeFailed);
+	}
+	let mut bytes = [0u8; N];
+	bytes.copy_from_slice(&payload[*offset..end]);
+	*offset = end;
+	Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
@@ -850,6 +981,17 @@ mod tests {
 				signature_digest: nonzero(13),
 			},
 		}
+	}
+
+	fn asset_output_proof_payload(pending_channel_id: [u8; 32], last: bool) -> Vec<u8> {
+		let mut payload = Vec::new();
+		payload.push(0);
+		payload.push(32);
+		payload.extend_from_slice(&pending_channel_id);
+		payload.push(2);
+		payload.push(1);
+		payload.push(u8::from(last));
+		payload
 	}
 
 	fn payment_request(direction: TaprootAssetPaymentDirection) -> TaprootAssetPaymentRequest {
@@ -914,6 +1056,60 @@ mod tests {
 			)
 			.unwrap();
 		assert_eq!(manager.list_received_messages().len(), 1);
+	}
+
+	#[test]
+	fn asset_output_proof_ack_matches_lightning_labs_tlv_shape() {
+		let pending_channel_id = nonzero(5);
+
+		let ack = encode_asset_funding_ack(pending_channel_id, true);
+
+		assert_eq!(ack.len(), 37);
+		assert_eq!(&ack[..2], &[0, 32]);
+		assert_eq!(&ack[2..34], pending_channel_id.as_slice());
+		assert_eq!(&ack[34..], &[1, 1, 1]);
+	}
+
+	#[test]
+	fn last_asset_output_proof_queues_funding_ack() {
+		let manager = manager(true);
+		let pending_channel_id = nonzero(5);
+
+		manager
+			.handle_message(
+				TaprootAssetWireMessage {
+					kind: TaprootAssetMessageKind::TxAssetOutputProof,
+					payload: asset_output_proof_payload(pending_channel_id, true),
+				},
+				peer(3),
+			)
+			.unwrap();
+
+		assert_eq!(manager.list_received_messages().len(), 1);
+		let pending = manager.get_and_clear_pending_messages();
+		assert_eq!(pending.len(), 1);
+		assert_eq!(pending[0].0, peer(3));
+		assert_eq!(pending[0].1.kind, TaprootAssetMessageKind::AssetFundingAccepted);
+		assert_eq!(pending[0].1.type_id(), ASSET_FUNDING_ACCEPTED_TYPE);
+		assert_eq!(pending[0].1.payload, encode_asset_funding_ack(pending_channel_id, true));
+	}
+
+	#[test]
+	fn non_last_asset_output_proof_does_not_ack() {
+		let manager = manager(true);
+
+		manager
+			.handle_message(
+				TaprootAssetWireMessage {
+					kind: TaprootAssetMessageKind::TxAssetOutputProof,
+					payload: asset_output_proof_payload(nonzero(5), false),
+				},
+				peer(3),
+			)
+			.unwrap();
+
+		assert_eq!(manager.list_received_messages().len(), 1);
+		assert!(manager.get_and_clear_pending_messages().is_empty());
 	}
 
 	#[test]
