@@ -101,6 +101,7 @@ pub mod logger;
 mod message_handler;
 pub mod payment;
 mod peer_store;
+pub mod provenance;
 mod runtime;
 mod scoring;
 mod tx_broadcaster;

@@ -1306,7 +1306,7 @@ where
 		let min_final_cltv_expiry_delta = MIN_FINAL_CLTV_EXPIRY_DELTA + 2;
 		let (payment_hash, payment_secret) = match payment_hash {
 			Some(payment_hash) => {
-				let payment_secret = self
+				let (payment_secret, _payment_metadata) = self
 					.channel_manager
 					.create_inbound_payment_for_hash(
 						payment_hash,
@@ -1321,13 +1321,21 @@ where
 					})?;
 				(payment_hash, payment_secret)
 			},
-			None => self
-				.channel_manager
-				.create_inbound_payment(None, expiry_secs, Some(min_final_cltv_expiry_delta), None)
-				.map_err(|e| {
-					log_error!(self.logger, "Failed to register inbound payment: {:?}", e);
-					Error::InvoiceCreationFailed
-				})?,
+			None => {
+				let (payment_hash, payment_secret, _payment_metadata) = self
+					.channel_manager
+					.create_inbound_payment(
+						None,
+						expiry_secs,
+						Some(min_final_cltv_expiry_delta),
+						None,
+					)
+					.map_err(|e| {
+						log_error!(self.logger, "Failed to register inbound payment: {:?}", e);
+						Error::InvoiceCreationFailed
+					})?;
+				(payment_hash, payment_secret)
+			},
 		};
 
 		let route_hint = RouteHint(vec![RouteHintHop {

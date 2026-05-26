@@ -10,6 +10,10 @@ A ready-to-go Lightning node library built using [LDK][ldk] and [BDK][bdk].
 
 LDK Node is a self-custodial Lightning node in library form. Its central goal is to provide a small, simple, and straightforward interface that enables users to easily set up and run a Lightning node with an integrated on-chain wallet. While minimalism is at its core, LDK Node aims to be sufficiently modular and configurable to be useful for a variety of use cases.
 
+## OpenAgentsInc Fork Status
+
+This fork is the live node runtime for the experimental `tap-ldk` Taproot Assets demo. It is currently pinned to `OpenAgentsInc/rust-lightning` revision `cbc508b8ae972fd1134b0c5f1dc1792139276268` with the simple-taproot MuSig2 feature enabled, and it exposes `ldk_node::provenance::runtime_provenance()` so demo harnesses can verify the forked runtime. BTC-only behavior remains the default node behavior; Taproot Asset channel negotiation and payment APIs are tracked in `OpenAgentsInc/tap-ldk` issues #79 through #81.
+
 ## Getting Started
 The primary abstraction of the library is the [`Node`][api_docs_node], which can be retrieved by setting up and configuring a [`Builder`][api_docs_builder] to your liking and calling one of the `build` methods. `Node` can then be controlled via commands such as `start`, `stop`, `open_channel`, `send`, etc.
 
