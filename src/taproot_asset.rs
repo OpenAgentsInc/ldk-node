@@ -10,13 +10,14 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use bitcoin::hashes::{sha256, Hash as _};
+use bitcoin::hashes::{sha256, Hash as _, HashEngine as _};
 use bitcoin::io::ErrorKind;
 use bitcoin::key::TapTweak;
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1};
 use bitcoin::taproot::{LeafVersion, TapNodeHash};
-use bitcoin::ScriptBuf;
+use bitcoin::{OutPoint as BitcoinOutPoint, ScriptBuf, Witness};
 use lightning::chain::transaction::OutPoint as LdkOutPoint;
+use lightning::ln::chan_utils::SimpleTaprootAssetCommitmentOutputKeys;
 use lightning::ln::msgs::DecodeError;
 use lightning::ln::taproot_asset::{
 	single_asset_channel_type, TaprootAssetChannelDescriptor, TaprootAssetChannelState,
@@ -34,8 +35,11 @@ use serde::{Deserialize, Serialize};
 use taproot_assets_core::verify::proof::verify_inclusion_proof;
 use taproot_assets_core::verify::taproot_proof::TapCommitment;
 use taproot_assets_core::{OpsError, TaprootOps};
-use taproot_assets_types::asset::SerializedKey;
+use taproot_assets_types::asset::{
+	Asset, AssetType, AssetVersion, GenesisInfo, PrevId, PrevWitness, ScriptKeyType, SerializedKey,
+};
 use taproot_assets_types::commitment::TapCommitmentVersion;
+use taproot_assets_types::mssmt::MssmtNode;
 use taproot_assets_types::proof::Proof as TaprootAssetProof;
 
 use crate::config::ExperimentalChannelConfig;
@@ -495,6 +499,24 @@ impl TaprootAssetManager {
 				sender_node_id,
 				tapscript_root,
 			)
+			.map_err(|err| TaprootAssetError::ChannelManager(format!("{err:?}")))?;
+		let output_keys = channel_manager
+			.pending_simple_taproot_asset_output_keys(
+				ChannelId(fields.pending_channel_id),
+				sender_node_id,
+			)
+			.map_err(|err| TaprootAssetError::ChannelManager(format!("{err:?}")))?;
+		let (holder_commitment_to_counterparty, counterparty_commitment_to_counterparty) =
+			derive_initial_remote_owner_aux_leaves(&fields.outputs, &output_keys)?;
+		channel_manager
+			.set_pending_simple_taproot_commitment_aux_leaves(
+				ChannelId(fields.pending_channel_id),
+				sender_node_id,
+				None,
+				Some(holder_commitment_to_counterparty),
+				None,
+				Some(counterparty_commitment_to_counterparty),
+			)
 			.map_err(|err| TaprootAssetError::ChannelManager(format!("{err:?}")))
 	}
 
@@ -941,6 +963,8 @@ struct AssetFundingCreatedFields {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct AssetFundingOutputProof {
+	asset_id: [u8; TAPROOT_ASSET_ID_LEN],
+	amount: u64,
 	proof: TaprootAssetProof,
 }
 
@@ -1017,6 +1041,8 @@ fn parse_asset_output_list(
 
 fn parse_asset_output(payload: &[u8]) -> Result<AssetFundingOutputProof, TaprootAssetError> {
 	let mut offset = 0usize;
+	let mut asset_id = None;
+	let mut amount = None;
 	let mut proof = None;
 
 	while offset < payload.len() {
@@ -1034,8 +1060,16 @@ fn parse_asset_output(payload: &[u8]) -> Result<AssetFundingOutputProof, Taproot
 		offset = record_end;
 
 		match record_type {
-			0 if record_value.len() == TAPROOT_ASSET_ID_LEN => {},
-			1 if record_value.len() == 8 => {},
+			0 if record_value.len() == TAPROOT_ASSET_ID_LEN => {
+				let mut id = [0u8; TAPROOT_ASSET_ID_LEN];
+				id.copy_from_slice(record_value);
+				asset_id = Some(id);
+			},
+			1 if record_value.len() == 8 => {
+				let mut bytes = [0u8; 8];
+				bytes.copy_from_slice(record_value);
+				amount = Some(u64::from_be_bytes(bytes));
+			},
 			2 => {
 				proof = Some(decode_lightning_labs_asset_output_proof(record_value)?);
 			},
@@ -1044,7 +1078,11 @@ fn parse_asset_output(payload: &[u8]) -> Result<AssetFundingOutputProof, Taproot
 		}
 	}
 
-	Ok(AssetFundingOutputProof { proof: proof.ok_or(TaprootAssetError::DecodeFailed)? })
+	Ok(AssetFundingOutputProof {
+		asset_id: asset_id.ok_or(TaprootAssetError::DecodeFailed)?,
+		amount: amount.ok_or(TaprootAssetError::DecodeFailed)?,
+		proof: proof.ok_or(TaprootAssetError::DecodeFailed)?,
+	})
 }
 
 fn decode_lightning_labs_asset_output_proof(
@@ -1202,7 +1240,420 @@ fn derive_asset_funding_tapscript_root(
 	root.ok_or(TaprootAssetError::DecodeFailed)
 }
 
+fn derive_initial_remote_owner_aux_leaves(
+	outputs: &[AssetFundingOutputProof], output_keys: &SimpleTaprootAssetCommitmentOutputKeys,
+) -> Result<(ScriptBuf, ScriptBuf), TaprootAssetError> {
+	let holder_commitment_to_counterparty = derive_initial_asset_aux_leaf_script(
+		outputs,
+		output_keys.holder_commitment_to_counterparty,
+	)?;
+	let counterparty_commitment_to_counterparty = derive_initial_asset_aux_leaf_script(
+		outputs,
+		output_keys.counterparty_commitment_to_counterparty,
+	)?;
+	Ok((holder_commitment_to_counterparty, counterparty_commitment_to_counterparty))
+}
+
+fn derive_initial_asset_aux_leaf_script(
+	outputs: &[AssetFundingOutputProof], base_output_key: [u8; 32],
+) -> Result<ScriptBuf, TaprootAssetError> {
+	if outputs.is_empty() {
+		return Err(TaprootAssetError::DecodeFailed);
+	}
+	let mut output_assets = Vec::with_capacity(outputs.len());
+	for output in outputs {
+		output_assets.push(initial_commitment_output_asset(output, base_output_key)?);
+	}
+	let commitment = tap_commitment_from_assets(&output_assets)?;
+	Ok(ScriptBuf::from_bytes(tap_commitment_leaf_script(&commitment)))
+}
+
+fn initial_commitment_output_asset(
+	output: &AssetFundingOutputProof, base_output_key: [u8; 32],
+) -> Result<Asset, TaprootAssetError> {
+	let mut asset = output.proof.asset.clone();
+	let genesis = asset.asset_genesis.as_ref().ok_or(TaprootAssetError::DecodeFailed)?;
+	if genesis.asset_id.to_byte_array() != output.asset_id {
+		return Err(TaprootAssetError::TaprootAssetProof(
+			"asset funding output id disagrees with proof asset id".to_owned(),
+		));
+	}
+	if asset.amount != output.amount {
+		return Err(TaprootAssetError::TaprootAssetProof(
+			"asset funding output amount disagrees with proof asset amount".to_owned(),
+		));
+	}
+	if asset.script_key.len() != 33 {
+		return Err(TaprootAssetError::TaprootAssetProof(
+			"asset funding proof has invalid script key length".to_owned(),
+		));
+	}
+
+	let mut previous_script_key = [0u8; 33];
+	previous_script_key.copy_from_slice(&asset.script_key);
+	let previous_outpoint =
+		asset.chain_anchor.as_ref().map(|anchor| anchor.anchor_outpoint).unwrap_or_else(|| {
+			BitcoinOutPoint {
+				txid: output.proof.anchor_tx.compute_txid(),
+				vout: output.proof.inclusion_proof.output_index,
+			}
+		});
+	let previous_id = PrevId {
+		out_point: previous_outpoint,
+		asset_id: genesis.asset_id,
+		script_key: SerializedKey { bytes: previous_script_key },
+	};
+
+	asset.version = AssetVersion::V1;
+	asset.amount = output.amount;
+	asset.lock_time = 0;
+	asset.relative_lock_time = 0;
+	asset.script_version = 0;
+	asset.script_key = compressed_even_key_from_xonly(base_output_key).to_vec();
+	asset.script_key_is_local = false;
+	asset.script_key_declared_known = false;
+	asset.script_key_has_script_path = false;
+	asset.script_key_type = ScriptKeyType::Channel;
+	asset.prev_witnesses = vec![PrevWitness {
+		prev_id: Some(previous_id),
+		tx_witness: Witness::new(),
+		split_commitment: None,
+	}];
+	asset.split_commitment_root = None;
+	asset.is_spent = false;
+	asset.is_burn = false;
+	Ok(asset)
+}
+
+fn compressed_even_key_from_xonly(xonly_key: [u8; 32]) -> [u8; 33] {
+	let mut script_key = [0u8; 33];
+	script_key[0] = 0x02;
+	script_key[1..].copy_from_slice(&xonly_key);
+	script_key
+}
+
+fn tap_commitment_from_assets(assets: &[Asset]) -> Result<TapCommitment, TaprootAssetError> {
+	let mut lower_commitments = BTreeMap::<[u8; 32], Vec<&Asset>>::new();
+	for asset in assets {
+		lower_commitments.entry(tap_commitment_key(asset)?).or_default().push(asset);
+	}
+
+	let mut tap_commitment_leaf_nodes = Vec::with_capacity(lower_commitments.len());
+	for (tap_key, assets) in lower_commitments {
+		let mut asset_leaf_nodes = Vec::with_capacity(assets.len());
+		for asset in assets {
+			let asset_key = asset_commitment_key(asset)?;
+			let asset_leaf = asset_leaf(asset)?;
+			let asset_root = mssmt_single_leaf_root(asset_key, asset_leaf)?;
+			asset_leaf_nodes.push((asset_key, asset_root));
+		}
+		let asset_commitment_root = fold_asset_commitment_roots(tap_key, &asset_leaf_nodes)?;
+		let asset_commitment_leaf = asset_commitment_leaf(
+			AssetVersion::V1,
+			asset_commitment_root.root_hash,
+			asset_commitment_root.root_sum,
+		);
+		let leaf_node = mssmt_leaf(&asset_commitment_leaf, asset_commitment_root.root_sum);
+		let tap_root = mssmt_single_leaf_root(tap_key, leaf_node)?;
+		tap_commitment_leaf_nodes.push((tap_key, tap_root));
+	}
+
+	let (root_hash, root_sum) = fold_tap_commitment_roots(&tap_commitment_leaf_nodes)?;
+	Ok(TapCommitment { version: TapCommitmentVersion::V2, root_hash, root_sum })
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct MssmtRootParts {
+	root_hash: [u8; 32],
+	root_sum: u64,
+	left_hash: [u8; 32],
+	right_hash: [u8; 32],
+}
+
+fn fold_asset_commitment_roots(
+	tap_key: [u8; 32], asset_roots: &[([u8; 32], MssmtRootParts)],
+) -> Result<MssmtRootParts, TaprootAssetError> {
+	if asset_roots.len() != 1 {
+		return Err(TaprootAssetError::TaprootAssetProof(
+			"initial Taproot Asset channel aux leaf currently supports one script key per asset id"
+				.to_owned(),
+		));
+	}
+	let root = &asset_roots[0].1;
+	let mut engine = sha256::Hash::engine();
+	engine.input(&tap_key);
+	engine.input(&root.left_hash);
+	engine.input(&root.right_hash);
+	engine.input(&root.root_sum.to_be_bytes());
+	let root_hash = sha256::Hash::from_engine(engine).to_byte_array();
+	Ok(MssmtRootParts {
+		root_hash,
+		root_sum: root.root_sum,
+		left_hash: [0; 32],
+		right_hash: [0; 32],
+	})
+}
+
+fn asset_commitment_leaf(version: AssetVersion, root_hash: [u8; 32], sum: u64) -> Vec<u8> {
+	let mut leaf = Vec::with_capacity(1 + 32 + 8);
+	leaf.push(version as u8);
+	leaf.extend_from_slice(&root_hash);
+	leaf.extend_from_slice(&sum.to_be_bytes());
+	leaf
+}
+
+fn fold_tap_commitment_roots(
+	tap_roots: &[([u8; 32], MssmtRootParts)],
+) -> Result<([u8; 32], u64), TaprootAssetError> {
+	if tap_roots.len() != 1 {
+		return Err(TaprootAssetError::TaprootAssetProof(
+			"initial Taproot Asset channel aux leaf currently supports one asset id".to_owned(),
+		));
+	}
+	Ok((tap_roots[0].1.root_hash, tap_roots[0].1.root_sum))
+}
+
+fn tap_commitment_key(asset: &Asset) -> Result<[u8; 32], TaprootAssetError> {
+	if let Some(group) = &asset.asset_group {
+		let key_bytes = if group.tweaked_group_key.is_empty() {
+			&group.raw_group_key
+		} else {
+			&group.tweaked_group_key
+		};
+		if key_bytes.len() != 33 {
+			return Err(TaprootAssetError::TaprootAssetProof(
+				"asset group key has invalid length".to_owned(),
+			));
+		}
+		let pubkey = PublicKey::from_slice(key_bytes).map_err(|_| {
+			TaprootAssetError::TaprootAssetProof("asset group key is invalid".to_owned())
+		})?;
+		let (xonly, _) = pubkey.x_only_public_key();
+		return Ok(sha256::Hash::hash(&xonly.serialize()).to_byte_array());
+	}
+	let genesis = asset.asset_genesis.as_ref().ok_or(TaprootAssetError::DecodeFailed)?;
+	Ok(genesis.asset_id.to_byte_array())
+}
+
+fn asset_commitment_key(asset: &Asset) -> Result<[u8; 32], TaprootAssetError> {
+	let genesis = asset.asset_genesis.as_ref().ok_or(TaprootAssetError::DecodeFailed)?;
+	if asset.script_key.len() != 33 {
+		return Err(TaprootAssetError::TaprootAssetProof(
+			"asset script key has invalid length".to_owned(),
+		));
+	}
+	let script_key = PublicKey::from_slice(&asset.script_key).map_err(|_| {
+		TaprootAssetError::TaprootAssetProof("asset script key is invalid".to_owned())
+	})?;
+	let (xonly, _) = script_key.x_only_public_key();
+
+	if asset.asset_group.is_none() {
+		return Ok(sha256::Hash::hash(&xonly.serialize()).to_byte_array());
+	}
+
+	let mut engine = sha256::Hash::engine();
+	engine.input(&genesis.asset_id.to_byte_array());
+	engine.input(&xonly.serialize());
+	Ok(sha256::Hash::from_engine(engine).to_byte_array())
+}
+
+fn asset_leaf(asset: &Asset) -> Result<MssmtNode, TaprootAssetError> {
+	let bytes = encode_asset(asset)?;
+	Ok(mssmt_leaf(&bytes, asset.amount))
+}
+
+fn encode_asset(asset: &Asset) -> Result<Vec<u8>, TaprootAssetError> {
+	let genesis = asset.asset_genesis.as_ref().ok_or(TaprootAssetError::DecodeFailed)?;
+	let mut out = Vec::new();
+
+	encode_record(0, &[asset.version as u8], &mut out)?;
+	let genesis_bytes = encode_genesis_info(genesis)?;
+	encode_record(2, &genesis_bytes, &mut out)?;
+	encode_record(4, &[asset_type_byte(genesis.asset_type)], &mut out)?;
+	let amount_bytes = encode_bigsize_to_vec(asset.amount)?;
+	encode_record(6, &amount_bytes, &mut out)?;
+	if asset.lock_time > 0 {
+		let bytes = encode_bigsize_to_vec(asset.lock_time as u64)?;
+		encode_record(7, &bytes, &mut out)?;
+	}
+	if asset.relative_lock_time > 0 {
+		let bytes = encode_bigsize_to_vec(asset.relative_lock_time as u64)?;
+		encode_record(9, &bytes, &mut out)?;
+	}
+	if !asset.prev_witnesses.is_empty() {
+		let witnesses = encode_prev_witnesses(&asset.prev_witnesses)?;
+		encode_record(11, &witnesses, &mut out)?;
+	}
+	let script_version = u16::try_from(asset.script_version).map_err(|_| {
+		TaprootAssetError::TaprootAssetProof("asset script version is invalid".to_owned())
+	})?;
+	encode_record(14, &script_version.to_be_bytes(), &mut out)?;
+	if asset.script_key.len() != 33 {
+		return Err(TaprootAssetError::TaprootAssetProof(
+			"asset script key has invalid length".to_owned(),
+		));
+	}
+	encode_record(16, &asset.script_key, &mut out)?;
+	if let Some(group) = asset.asset_group.as_ref() {
+		if group.raw_group_key.len() != 33 {
+			return Err(TaprootAssetError::TaprootAssetProof(
+				"asset raw group key has invalid length".to_owned(),
+			));
+		}
+		encode_record(17, &group.raw_group_key, &mut out)?;
+	}
+
+	Ok(out)
+}
+
+fn encode_genesis_info(genesis: &GenesisInfo) -> Result<Vec<u8>, TaprootAssetError> {
+	let mut out = Vec::new();
+	encode_outpoint(&genesis.genesis_point, &mut out);
+	encode_outpoint(&genesis.genesis_point, &mut out);
+	encode_inline_var_bytes(genesis.name.as_bytes(), &mut out)?;
+	out.extend_from_slice(&genesis.meta_hash.to_byte_array());
+	out.extend_from_slice(&genesis.output_index.to_be_bytes());
+	out.push(asset_type_byte(genesis.asset_type));
+	Ok(out)
+}
+
+fn encode_outpoint(out_point: &BitcoinOutPoint, out: &mut Vec<u8>) {
+	out.extend_from_slice(&out_point.txid.to_byte_array());
+	out.extend_from_slice(&out_point.vout.to_be_bytes());
+}
+
+fn asset_type_byte(asset_type: AssetType) -> u8 {
+	match asset_type {
+		AssetType::Normal => 0,
+		AssetType::Collectible => 1,
+	}
+}
+
+fn encode_prev_witnesses(witnesses: &[PrevWitness]) -> Result<Vec<u8>, TaprootAssetError> {
+	let mut out = Vec::new();
+	push_bigsize(witnesses.len() as u64, &mut out)?;
+	for witness in witnesses {
+		let bytes = encode_prev_witness(witness)?;
+		encode_inline_var_bytes(&bytes, &mut out)?;
+	}
+	Ok(out)
+}
+
+fn encode_prev_witness(witness: &PrevWitness) -> Result<Vec<u8>, TaprootAssetError> {
+	let mut out = Vec::new();
+	if let Some(prev_id) = witness.prev_id.as_ref() {
+		let bytes = encode_prev_id(prev_id);
+		encode_record(1, &bytes, &mut out)?;
+	}
+	Ok(out)
+}
+
+fn encode_prev_id(prev_id: &PrevId) -> Vec<u8> {
+	let mut out = Vec::new();
+	encode_outpoint(&prev_id.out_point, &mut out);
+	out.extend_from_slice(&prev_id.asset_id.to_byte_array());
+	out.extend_from_slice(&prev_id.script_key.bytes);
+	out
+}
+
+fn encode_record(
+	record_type: u64, value: &[u8], out: &mut Vec<u8>,
+) -> Result<(), TaprootAssetError> {
+	push_bigsize(record_type, out)?;
+	push_bigsize(value.len() as u64, out)?;
+	out.extend_from_slice(value);
+	Ok(())
+}
+
+fn encode_bigsize_to_vec(value: u64) -> Result<Vec<u8>, TaprootAssetError> {
+	let mut out = Vec::new();
+	push_bigsize(value, &mut out)?;
+	Ok(out)
+}
+
+fn encode_inline_var_bytes(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), TaprootAssetError> {
+	push_bigsize(bytes.len() as u64, out)?;
+	out.extend_from_slice(bytes);
+	Ok(())
+}
+
+fn mssmt_single_leaf_root(
+	key: [u8; 32], leaf: MssmtNode,
+) -> Result<MssmtRootParts, TaprootAssetError> {
+	const MSSMT_TREE_LEVELS: usize = 256;
+	let empty_nodes = mssmt_empty_nodes()?;
+	let mut current = leaf;
+	let mut root_left = [0u8; 32];
+	let mut root_right = [0u8; 32];
+
+	for i in (0..MSSMT_TREE_LEVELS).rev() {
+		let sibling = &empty_nodes[i + 1];
+		let bit = mssmt_bit_index(i as u8, &key);
+		let (left, right) = if bit == 0 { (&current, sibling) } else { (sibling, &current) };
+		if i == 0 {
+			root_left = left.hash.to_byte_array();
+			root_right = right.hash.to_byte_array();
+		}
+		current = mssmt_branch(left, right)?;
+	}
+
+	Ok(MssmtRootParts {
+		root_hash: current.hash.to_byte_array(),
+		root_sum: current.sum,
+		left_hash: root_left,
+		right_hash: root_right,
+	})
+}
+
+fn mssmt_leaf(value: &[u8], sum: u64) -> MssmtNode {
+	let mut engine = sha256::Hash::engine();
+	engine.input(value);
+	engine.input(&sum.to_be_bytes());
+	let hash = sha256::Hash::from_engine(engine);
+	MssmtNode { hash, sum }
+}
+
+fn mssmt_branch(left: &MssmtNode, right: &MssmtNode) -> Result<MssmtNode, TaprootAssetError> {
+	let sum = left
+		.sum
+		.checked_add(right.sum)
+		.ok_or_else(|| TaprootAssetError::TaprootAssetProof("mssmt sum overflow".to_owned()))?;
+	let mut engine = sha256::Hash::engine();
+	engine.input(&left.hash.to_byte_array());
+	engine.input(&right.hash.to_byte_array());
+	engine.input(&sum.to_be_bytes());
+	let hash = sha256::Hash::from_engine(engine);
+	Ok(MssmtNode { hash, sum })
+}
+
+fn mssmt_bit_index(idx: u8, key: &[u8; 32]) -> u8 {
+	let byte_val = key[(idx / 8) as usize];
+	(byte_val >> (idx % 8)) & 1
+}
+
+fn mssmt_empty_nodes() -> Result<Vec<MssmtNode>, TaprootAssetError> {
+	const MSSMT_TREE_LEVELS: usize = 256;
+	let mut nodes = Vec::with_capacity(MSSMT_TREE_LEVELS + 1);
+	nodes.resize_with(MSSMT_TREE_LEVELS + 1, || MssmtNode {
+		hash: sha256::Hash::all_zeros(),
+		sum: 0,
+	});
+
+	let leaf = mssmt_leaf(&[], 0);
+	nodes[MSSMT_TREE_LEVELS] = leaf.clone();
+	for i in (0..MSSMT_TREE_LEVELS).rev() {
+		nodes[i] = mssmt_branch(&nodes[i + 1], &nodes[i + 1])?;
+	}
+	Ok(nodes)
+}
+
 fn tap_commitment_tapscript_root(commitment: &TapCommitment) -> [u8; 32] {
+	let script = tap_commitment_leaf_script(commitment);
+	TapNodeHash::from_script(ScriptBuf::from_bytes(script).as_script(), LeafVersion::TapScript)
+		.to_byte_array()
+}
+
+fn tap_commitment_leaf_script(commitment: &TapCommitment) -> Vec<u8> {
 	let mut script = Vec::with_capacity(73);
 	match commitment.version {
 		TapCommitmentVersion::V0 | TapCommitmentVersion::V1 => {
@@ -1218,8 +1669,7 @@ fn tap_commitment_tapscript_root(commitment: &TapCommitment) -> [u8; 32] {
 			script.extend_from_slice(&commitment.root_sum.to_be_bytes());
 		},
 	}
-	TapNodeHash::from_script(ScriptBuf::from_bytes(script).as_script(), LeafVersion::TapScript)
-		.to_byte_array()
+	script
 }
 
 #[derive(Debug)]
