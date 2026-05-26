@@ -1037,10 +1037,7 @@ fn parse_asset_output(payload: &[u8]) -> Result<AssetFundingOutputProof, Taproot
 			0 if record_value.len() == TAPROOT_ASSET_ID_LEN => {},
 			1 if record_value.len() == 8 => {},
 			2 => {
-				proof = Some(
-					TaprootAssetProof::from_bytes(record_value)
-						.map_err(|err| TaprootAssetError::TaprootAssetProof(err.to_string()))?,
-				);
+				proof = Some(decode_lightning_labs_asset_output_proof(record_value)?);
 			},
 			typ if typ % 2 == 1 => {},
 			_ => return Err(TaprootAssetError::DecodeFailed),
@@ -1048,6 +1045,139 @@ fn parse_asset_output(payload: &[u8]) -> Result<AssetFundingOutputProof, Taproot
 	}
 
 	Ok(AssetFundingOutputProof { proof: proof.ok_or(TaprootAssetError::DecodeFailed)? })
+}
+
+fn decode_lightning_labs_asset_output_proof(
+	payload: &[u8],
+) -> Result<TaprootAssetProof, TaprootAssetError> {
+	let proof = TaprootAssetProof::from_bytes(payload)
+		.map_err(|err| TaprootAssetError::TaprootAssetProof(err.to_string()))?;
+	if inclusion_proof_has_asset_proof(&proof) {
+		return Ok(proof);
+	}
+
+	let Some(repaired) = repair_lightning_labs_commitment_asset_proof_type(payload)? else {
+		return Ok(proof);
+	};
+
+	TaprootAssetProof::from_bytes(&repaired)
+		.map_err(|err| TaprootAssetError::TaprootAssetProof(err.to_string()))
+}
+
+fn inclusion_proof_has_asset_proof(proof: &TaprootAssetProof) -> bool {
+	proof
+		.inclusion_proof
+		.commitment_proof
+		.as_ref()
+		.and_then(|commitment_proof| commitment_proof.proof.asset_proof.as_ref())
+		.is_some()
+}
+
+fn repair_lightning_labs_commitment_asset_proof_type(
+	payload: &[u8],
+) -> Result<Option<Vec<u8>>, TaprootAssetError> {
+	const TAPP_MAGIC: &[u8; 4] = b"TAPP";
+	if payload.len() < TAPP_MAGIC.len() || &payload[..TAPP_MAGIC.len()] != TAPP_MAGIC {
+		return Ok(None);
+	}
+
+	let (repaired_records, changed) =
+		rewrite_tlv_records(&payload[TAPP_MAGIC.len()..], |record_type, record_value| {
+			if record_type == 12 {
+				repair_taproot_proof_commitment_asset_proof_type(record_value)
+			} else {
+				Ok((record_value.to_vec(), false))
+			}
+		})?;
+	if !changed {
+		return Ok(None);
+	}
+
+	let mut repaired = Vec::with_capacity(payload.len());
+	repaired.extend_from_slice(TAPP_MAGIC);
+	repaired.extend_from_slice(&repaired_records);
+	Ok(Some(repaired))
+}
+
+fn repair_taproot_proof_commitment_asset_proof_type(
+	payload: &[u8],
+) -> Result<(Vec<u8>, bool), TaprootAssetError> {
+	rewrite_tlv_records(payload, |record_type, record_value| {
+		if record_type == 3 {
+			repair_commitment_proof_asset_proof_type(record_value)
+		} else {
+			Ok((record_value.to_vec(), false))
+		}
+	})
+}
+
+fn repair_commitment_proof_asset_proof_type(
+	payload: &[u8],
+) -> Result<(Vec<u8>, bool), TaprootAssetError> {
+	let mut offset = 0usize;
+	let mut out = Vec::with_capacity(payload.len());
+	let mut changed = false;
+	while offset < payload.len() {
+		let record_type = read_bigsize(payload, &mut offset)?;
+		let record_len = read_bigsize(payload, &mut offset)?;
+		if record_len > usize::MAX as u64 {
+			return Err(TaprootAssetError::DecodeFailed);
+		}
+		let record_len = record_len as usize;
+		let record_end = offset.checked_add(record_len).ok_or(TaprootAssetError::DecodeFailed)?;
+		if record_end > payload.len() {
+			return Err(TaprootAssetError::DecodeFailed);
+		}
+		let record_value = &payload[offset..record_end];
+		offset = record_end;
+
+		// Lightning Labs' commitment.ProofAssetProofType is TLV type 1, while
+		// taproot-assets-types 0.0.2 currently expects type 0. Rewrite only
+		// this nested record for local verification; the original wire payload
+		// is not persisted or forwarded.
+		let repaired_type = if record_type == 1 {
+			changed = true;
+			0
+		} else {
+			record_type
+		};
+		push_bigsize(repaired_type, &mut out)?;
+		push_bigsize(record_value.len() as u64, &mut out)?;
+		out.extend_from_slice(record_value);
+	}
+	Ok((out, changed))
+}
+
+fn rewrite_tlv_records<F>(
+	payload: &[u8], mut rewrite: F,
+) -> Result<(Vec<u8>, bool), TaprootAssetError>
+where
+	F: FnMut(u64, &[u8]) -> Result<(Vec<u8>, bool), TaprootAssetError>,
+{
+	let mut offset = 0usize;
+	let mut out = Vec::with_capacity(payload.len());
+	let mut changed = false;
+	while offset < payload.len() {
+		let record_type = read_bigsize(payload, &mut offset)?;
+		let record_len = read_bigsize(payload, &mut offset)?;
+		if record_len > usize::MAX as u64 {
+			return Err(TaprootAssetError::DecodeFailed);
+		}
+		let record_len = record_len as usize;
+		let record_end = offset.checked_add(record_len).ok_or(TaprootAssetError::DecodeFailed)?;
+		if record_end > payload.len() {
+			return Err(TaprootAssetError::DecodeFailed);
+		}
+		let record_value = &payload[offset..record_end];
+		offset = record_end;
+
+		let (rewritten_value, record_changed) = rewrite(record_type, record_value)?;
+		changed |= record_changed;
+		push_bigsize(record_type, &mut out)?;
+		push_bigsize(rewritten_value.len() as u64, &mut out)?;
+		out.extend_from_slice(&rewritten_value);
+	}
+	Ok((out, changed))
 }
 
 fn derive_asset_funding_tapscript_root(
@@ -1167,6 +1297,25 @@ fn read_bigsize(payload: &[u8], offset: &mut usize) -> Result<u64, TaprootAssetE
 	}
 }
 
+fn push_bigsize(value: u64, out: &mut Vec<u8>) -> Result<(), TaprootAssetError> {
+	match value {
+		0x00..=0xfc => out.push(value as u8),
+		0xfd..=0xffff => {
+			out.push(0xfd);
+			out.extend_from_slice(&(value as u16).to_be_bytes());
+		},
+		0x1_0000..=0xffff_ffff => {
+			out.push(0xfe);
+			out.extend_from_slice(&(value as u32).to_be_bytes());
+		},
+		_ => {
+			out.push(0xff);
+			out.extend_from_slice(&value.to_be_bytes());
+		},
+	}
+	Ok(())
+}
+
 fn read_fixed<const N: usize>(
 	payload: &[u8], offset: &mut usize,
 ) -> Result<[u8; N], TaprootAssetError> {
@@ -1252,6 +1401,14 @@ mod tests {
 		payload
 	}
 
+	fn tlv_record(record_type: u64, value: &[u8]) -> Vec<u8> {
+		let mut record = Vec::new();
+		push_bigsize(record_type, &mut record).unwrap();
+		push_bigsize(value.len() as u64, &mut record).unwrap();
+		record.extend_from_slice(value);
+		record
+	}
+
 	fn payment_request(direction: TaprootAssetPaymentDirection) -> TaprootAssetPaymentRequest {
 		let metadata = TaprootAssetPaymentMetadata {
 			asset_id: nonzero(7),
@@ -1326,6 +1483,26 @@ mod tests {
 		assert_eq!(&ack[..2], &[0, 32]);
 		assert_eq!(&ack[2..34], pending_channel_id.as_slice());
 		assert_eq!(&ack[34..], &[1, 1, 1]);
+	}
+
+	#[test]
+	fn repairs_lightning_labs_nested_asset_proof_type_for_local_decode() {
+		let mut commitment_proof = Vec::new();
+		commitment_proof.extend_from_slice(&tlv_record(1, &[0xaa, 0xbb]));
+		commitment_proof.extend_from_slice(&tlv_record(2, &[0xcc]));
+		let taproot_proof = tlv_record(3, &commitment_proof);
+		let mut proof = b"TAPP".to_vec();
+		proof.extend_from_slice(&tlv_record(12, &taproot_proof));
+
+		let repaired = repair_lightning_labs_commitment_asset_proof_type(&proof).unwrap().unwrap();
+
+		let mut expected_commitment_proof = Vec::new();
+		expected_commitment_proof.extend_from_slice(&tlv_record(0, &[0xaa, 0xbb]));
+		expected_commitment_proof.extend_from_slice(&tlv_record(2, &[0xcc]));
+		let expected_taproot_proof = tlv_record(3, &expected_commitment_proof);
+		let mut expected = b"TAPP".to_vec();
+		expected.extend_from_slice(&tlv_record(12, &expected_taproot_proof));
+		assert_eq!(repaired, expected);
 	}
 
 	#[test]
