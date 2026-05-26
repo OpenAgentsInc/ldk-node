@@ -78,6 +78,7 @@ use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::peer_store::PeerStore;
 use crate::runtime::{Runtime, RuntimeSpawner};
+use crate::taproot_asset::TaprootAssetManager;
 use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
 	AsyncPersister, ChainMonitor, ChannelManager, DynStore, DynStoreRef, DynStoreWrapper,
@@ -1893,55 +1894,60 @@ fn build_with_store_internal(
 		},
 	};
 
-	let (liquidity_source, custom_message_handler) =
-		if let Some(lsc) = liquidity_source_config.as_ref() {
-			let mut liquidity_source_builder = LiquiditySourceBuilder::new(
-				Arc::clone(&wallet),
-				Arc::clone(&channel_manager),
-				Arc::clone(&keys_manager),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
+	let liquidity_source = if let Some(lsc) = liquidity_source_config.as_ref() {
+		let mut liquidity_source_builder = LiquiditySourceBuilder::new(
+			Arc::clone(&wallet),
+			Arc::clone(&channel_manager),
+			Arc::clone(&keys_manager),
+			Arc::clone(&tx_broadcaster),
+			Arc::clone(&kv_store),
+			Arc::clone(&config),
+			Arc::clone(&logger),
+		);
+
+		lsc.lsps1_client.as_ref().map(|config| {
+			liquidity_source_builder.lsps1_client(
+				config.node_id,
+				config.address.clone(),
+				config.token.clone(),
+			)
+		});
+
+		lsc.lsps2_client.as_ref().map(|config| {
+			liquidity_source_builder.lsps2_client(
+				config.node_id,
+				config.address.clone(),
+				config.token.clone(),
+			)
+		});
+
+		let promise_secret = {
+			let lsps_xpriv = derive_xprv(
 				Arc::clone(&config),
+				&seed_bytes,
+				LSPS_HARDENED_CHILD_INDEX,
 				Arc::clone(&logger),
-			);
-
-			lsc.lsps1_client.as_ref().map(|config| {
-				liquidity_source_builder.lsps1_client(
-					config.node_id,
-					config.address.clone(),
-					config.token.clone(),
-				)
-			});
-
-			lsc.lsps2_client.as_ref().map(|config| {
-				liquidity_source_builder.lsps2_client(
-					config.node_id,
-					config.address.clone(),
-					config.token.clone(),
-				)
-			});
-
-			let promise_secret = {
-				let lsps_xpriv = derive_xprv(
-					Arc::clone(&config),
-					&seed_bytes,
-					LSPS_HARDENED_CHILD_INDEX,
-					Arc::clone(&logger),
-				)?;
-				lsps_xpriv.private_key.secret_bytes()
-			};
-			lsc.lsps2_service.as_ref().map(|config| {
-				liquidity_source_builder.lsps2_service(promise_secret, config.clone())
-			});
-
-			let liquidity_source = runtime
-				.block_on(async move { liquidity_source_builder.build().await.map(Arc::new) })?;
-			let custom_message_handler =
-				Arc::new(NodeCustomMessageHandler::new_liquidity(Arc::clone(&liquidity_source)));
-			(Some(liquidity_source), custom_message_handler)
-		} else {
-			(None, Arc::new(NodeCustomMessageHandler::new_ignoring()))
+			)?;
+			lsps_xpriv.private_key.secret_bytes()
 		};
+		lsc.lsps2_service
+			.as_ref()
+			.map(|config| liquidity_source_builder.lsps2_service(promise_secret, config.clone()));
+
+		let liquidity_source = runtime
+			.block_on(async move { liquidity_source_builder.build().await.map(Arc::new) })?;
+		Some(liquidity_source)
+	} else {
+		None
+	};
+	let taproot_asset_manager = Arc::new(TaprootAssetManager::new(
+		config.experimental_channel_config,
+		Arc::clone(&kv_store),
+	));
+	let custom_message_handler = Arc::new(NodeCustomMessageHandler::new(
+		liquidity_source.clone(),
+		Arc::clone(&taproot_asset_manager),
+	));
 
 	let msg_handler = match gossip_source.as_gossip_sync() {
 		GossipSync::P2P(p2p_gossip_sync) => MessageHandler {
@@ -2091,6 +2097,7 @@ fn build_with_store_internal(
 		gossip_source,
 		pathfinding_scores_sync_url,
 		liquidity_source,
+		taproot_asset_manager,
 		kv_store,
 		logger,
 		_router: router,

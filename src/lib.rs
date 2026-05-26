@@ -104,6 +104,7 @@ mod peer_store;
 pub mod provenance;
 mod runtime;
 mod scoring;
+pub mod taproot_asset;
 mod tx_broadcaster;
 mod types;
 mod wallet;
@@ -172,6 +173,7 @@ use payment::{
 };
 use peer_store::{PeerInfo, PeerStore};
 use runtime::Runtime;
+use taproot_asset::{TaprootAsset, TaprootAssetManager};
 pub use tokio;
 use types::{
 	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, DynStore, Graph,
@@ -228,6 +230,7 @@ pub struct Node {
 	gossip_source: Arc<GossipSource>,
 	pathfinding_scores_sync_url: Option<String>,
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
+	taproot_asset_manager: Arc<TaprootAssetManager>,
 	kv_store: Arc<DynStore>,
 	logger: Arc<Logger>,
 	_router: Arc<Router>,
@@ -798,6 +801,15 @@ impl Node {
 	/// Returns the experimental channel negotiation flags this node was built with.
 	pub fn experimental_channel_config(&self) -> ExperimentalChannelConfig {
 		self.config.experimental_channel_config
+	}
+
+	/// Returns the experimental Taproot Asset channel handler.
+	///
+	/// The handler rejects all state-changing calls unless the node was built with explicit
+	/// Taproot Asset channel negotiation flags. Normal BTC-only node behavior does not require
+	/// this handle.
+	pub fn taproot_asset(&self) -> TaprootAsset {
+		TaprootAsset::new(Arc::clone(&self.taproot_asset_manager), self.node_id())
 	}
 
 	/// Returns the next event in the event queue, if currently available.
