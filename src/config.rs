@@ -127,6 +127,7 @@ pub(crate) const LNURL_AUTH_TIMEOUT_SECS: u64 = 15;
 /// | `trusted_peers_0conf`                  | []                                   |
 /// | `probing_liquidity_limit_multiplier`   | 3                                    |
 /// | `anchor_channels_config`               | Some(..)                             |
+/// | `experimental_channel_config`          | ExperimentalChannelConfig::default() |
 /// | `route_parameters`                     | None                                 |
 /// | `tor_config`                           | None                                 |
 /// | `hrn_config`                           | HumanReadableNamesConfig::default()  |
@@ -186,6 +187,11 @@ pub struct Config {
 	/// closure. We *will* however still try to get the Anchor spending transactions confirmed
 	/// on-chain with the funds available.
 	pub anchor_channels_config: Option<AnchorChannelsConfig>,
+	/// Experimental channel negotiation options for fork-only demo paths.
+	///
+	/// The default keeps normal node behavior BTC-only. Enable these only for regtest or explicit
+	/// protocol experiments.
+	pub experimental_channel_config: ExperimentalChannelConfig,
 	/// Configuration options for payment routing and pathfinding.
 	///
 	/// Setting the [`RouteParametersConfig`] provides flexibility to customize how payments are routed,
@@ -217,11 +223,36 @@ impl Default for Config {
 			trusted_peers_0conf: Vec::new(),
 			probing_liquidity_limit_multiplier: DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER,
 			anchor_channels_config: Some(AnchorChannelsConfig::default()),
+			experimental_channel_config: ExperimentalChannelConfig::default(),
 			tor_config: None,
 			route_parameters: None,
 			node_alias: None,
 			hrn_config: HumanReadableNamesConfig::default(),
 		}
+	}
+}
+
+/// Experimental channel negotiation options for OpenAgentsInc fork-only demo paths.
+///
+/// Defaults keep `ldk-node` BTC-only. Taproot Asset channels are layered on the BOLT simple
+/// taproot base, so enabling Taproot Asset channels without simple taproot support is invalid.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ExperimentalChannelConfig {
+	/// Advertise and negotiate BOLT simple taproot channels for future channels.
+	pub negotiate_simple_taproot_channels: bool,
+	/// Advertise and negotiate the experimental single-asset Taproot Asset channel overlay.
+	pub negotiate_taproot_asset_channels: bool,
+}
+
+impl ExperimentalChannelConfig {
+	/// Returns a config that enables both simple taproot and Taproot Asset channel negotiation.
+	pub fn taproot_assets_regtest() -> Self {
+		Self { negotiate_simple_taproot_channels: true, negotiate_taproot_asset_channels: true }
+	}
+
+	pub(crate) fn is_valid(&self) -> bool {
+		!self.negotiate_taproot_asset_channels || self.negotiate_simple_taproot_channels
 	}
 }
 
@@ -403,6 +434,10 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.channel_handshake_limits.force_announced_channel_preference = false;
 	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx =
 		config.anchor_channels_config.is_some();
+	user_config.channel_handshake_config.negotiate_simple_taproot_channels =
+		config.experimental_channel_config.negotiate_simple_taproot_channels;
+	user_config.channel_handshake_config.negotiate_taproot_asset_channels =
+		config.experimental_channel_config.negotiate_taproot_asset_channels;
 	user_config.reject_inbound_splices = false;
 
 	if may_announce_channel(config).is_err() {
@@ -699,7 +734,10 @@ pub enum AsyncPaymentsRole {
 mod tests {
 	use std::str::FromStr;
 
-	use super::{may_announce_channel, AnnounceError, Config, NodeAlias, SocketAddress};
+	use super::{
+		default_user_config, may_announce_channel, AnnounceError, Config,
+		ExperimentalChannelConfig, NodeAlias, SocketAddress,
+	};
 
 	#[test]
 	fn node_announce_channel() {
@@ -745,5 +783,38 @@ mod tests {
 			addresses.push(socket_address);
 		}
 		assert!(may_announce_channel(&node_config).is_ok());
+	}
+
+	#[test]
+	fn experimental_channel_config_defaults_to_btc_only() {
+		let node_config = Config::default();
+		let user_config = default_user_config(&node_config);
+
+		assert!(!node_config.experimental_channel_config.negotiate_simple_taproot_channels);
+		assert!(!node_config.experimental_channel_config.negotiate_taproot_asset_channels);
+		assert!(!user_config.channel_handshake_config.negotiate_simple_taproot_channels);
+		assert!(!user_config.channel_handshake_config.negotiate_taproot_asset_channels);
+	}
+
+	#[test]
+	fn experimental_channel_config_maps_to_ldk_user_config() {
+		let mut node_config = Config::default();
+		node_config.experimental_channel_config =
+			ExperimentalChannelConfig::taproot_assets_regtest();
+		let user_config = default_user_config(&node_config);
+
+		assert!(user_config.channel_handshake_config.negotiate_simple_taproot_channels);
+		assert!(user_config.channel_handshake_config.negotiate_taproot_asset_channels);
+		assert!(node_config.experimental_channel_config.is_valid());
+	}
+
+	#[test]
+	fn taproot_asset_config_requires_simple_taproot() {
+		let config = ExperimentalChannelConfig {
+			negotiate_simple_taproot_channels: false,
+			negotiate_taproot_asset_channels: true,
+		};
+
+		assert!(!config.is_valid());
 	}
 }

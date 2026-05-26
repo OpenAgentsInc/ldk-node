@@ -49,8 +49,9 @@ use vss_client::headers::VssHeaderProvider;
 use crate::chain::ChainSource;
 use crate::config::{
 	default_user_config, may_announce_channel, AnnounceError, AsyncPaymentsRole,
-	BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig, HRNResolverConfig,
-	TorConfig, DEFAULT_ESPLORA_SERVER_URL, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL,
+	BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig,
+	ExperimentalChannelConfig, HRNResolverConfig, TorConfig, DEFAULT_ESPLORA_SERVER_URL,
+	DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL,
 };
 use crate::connection::ConnectionManager;
 use crate::entropy::NodeEntropy;
@@ -198,6 +199,8 @@ pub enum BuildError {
 	NetworkMismatch,
 	/// The role of the node in an asynchronous payments context is not compatible with the current configuration.
 	AsyncPaymentsConfigMismatch,
+	/// The experimental channel configuration is invalid.
+	InvalidExperimentalChannelConfig,
 	/// An attempt to setup a DNS Resolver failed.
 	DNSResolverSetupFailed,
 }
@@ -232,6 +235,12 @@ impl fmt::Display for BuildError {
 				write!(
 					f,
 					"The async payments role is not compatible with the current configuration."
+				)
+			},
+			Self::InvalidExperimentalChannelConfig => {
+				write!(
+					f,
+					"Taproot Asset channel negotiation requires simple taproot channel negotiation."
 				)
 			},
 			Self::DNSResolverSetupFailed => {
@@ -544,6 +553,17 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Sets experimental channel negotiation options.
+	///
+	/// Defaults remain BTC-only. Taproot Asset channel negotiation requires simple taproot channel
+	/// negotiation and will fail during build if configured without it.
+	pub fn set_experimental_channel_config(
+		&mut self, experimental_channel_config: ExperimentalChannelConfig,
+	) -> &mut Self {
+		self.config.experimental_channel_config = experimental_channel_config;
+		self
+	}
+
 	/// Sets the IP address and TCP port on which [`Node`] will listen for incoming network connections.
 	pub fn set_listening_addresses(
 		&mut self, listening_addresses: Vec<SocketAddress>,
@@ -791,6 +811,10 @@ impl NodeBuilder {
 	fn build_with_store_and_logger<S: SyncAndAsyncKVStore + Send + Sync + 'static>(
 		&self, node_entropy: NodeEntropy, kv_store: S, logger: Arc<Logger>,
 	) -> Result<Node, BuildError> {
+		if !self.config.experimental_channel_config.is_valid() {
+			return Err(BuildError::InvalidExperimentalChannelConfig);
+		}
+
 		let runtime = if let Some(handle) = self.runtime_handle.as_ref() {
 			Arc::new(Runtime::with_handle(handle.clone(), Arc::clone(&logger)))
 		} else {
@@ -1052,6 +1076,16 @@ impl ArcedNodeBuilder {
 	/// Sets the Bitcoin network used.
 	pub fn set_network(&self, network: Network) {
 		self.inner.write().expect("lock").set_network(network);
+	}
+
+	/// Sets experimental channel negotiation options.
+	pub fn set_experimental_channel_config(
+		&self, experimental_channel_config: ExperimentalChannelConfig,
+	) {
+		self.inner
+			.write()
+			.expect("lock")
+			.set_experimental_channel_config(experimental_channel_config);
 	}
 
 	/// Sets the IP address and TCP port on which [`Node`] will listen for incoming network connections.
@@ -2155,6 +2189,10 @@ pub(crate) fn sanitize_alias(alias_str: &str) -> Result<NodeAlias, BuildError> {
 
 #[cfg(test)]
 mod tests {
+	use crate::config::{Config, ExperimentalChannelConfig};
+	use crate::entropy::NodeEntropy;
+	use crate::io::test_utils::InMemoryStore;
+
 	use super::{sanitize_alias, BuildError, NodeAlias};
 
 	#[test]
@@ -2191,5 +2229,19 @@ mod tests {
 		let alias = "This is a string longer than thirty-two bytes!"; // 46 bytes
 		let node = sanitize_alias(alias);
 		assert_eq!(node.err().unwrap(), BuildError::InvalidNodeAlias);
+	}
+
+	#[test]
+	fn taproot_asset_config_without_simple_taproot_fails_build() {
+		let mut config = Config::default();
+		config.experimental_channel_config = ExperimentalChannelConfig {
+			negotiate_simple_taproot_channels: false,
+			negotiate_taproot_asset_channels: true,
+		};
+		let builder = super::NodeBuilder::from_config(config);
+		let result =
+			builder.build_with_store(NodeEntropy::from_seed_bytes([7; 64]), InMemoryStore::new());
+
+		assert!(matches!(result, Err(BuildError::InvalidExperimentalChannelConfig)));
 	}
 }

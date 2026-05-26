@@ -131,8 +131,8 @@ pub use builder::NodeBuilder as Builder;
 use chain::ChainSource;
 use config::{
 	default_user_config, may_announce_channel, AsyncPaymentsRole, ChannelConfig, Config,
-	LNURL_AUTH_TIMEOUT_SECS, NODE_ANN_BCAST_INTERVAL, PEER_RECONNECTION_INTERVAL,
-	RGS_SYNC_INTERVAL,
+	ExperimentalChannelConfig, LNURL_AUTH_TIMEOUT_SECS, NODE_ANN_BCAST_INTERVAL,
+	PEER_RECONNECTION_INTERVAL, RGS_SYNC_INTERVAL,
 };
 use connection::ConnectionManager;
 pub use error::Error as NodeError;
@@ -793,6 +793,11 @@ impl Node {
 	/// Returns the config with which the [`Node`] was initialized.
 	pub fn config(&self) -> Config {
 		self.config.as_ref().clone()
+	}
+
+	/// Returns the experimental channel negotiation flags this node was built with.
+	pub fn experimental_channel_config(&self) -> ExperimentalChannelConfig {
+		self.config.experimental_channel_config
 	}
 
 	/// Returns the next event in the event queue, if currently available.
