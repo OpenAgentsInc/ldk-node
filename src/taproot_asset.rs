@@ -35,6 +35,8 @@ use crate::types::DynStore;
 const TAPROOT_ASSET_PRIMARY_NAMESPACE: &str = "taproot_asset";
 const TAPROOT_ASSET_SECONDARY_NAMESPACE: &str = "runtime";
 const TAPROOT_ASSET_STATE_KEY: &str = "state";
+const TAPROOT_ASSET_AUX_FEATURE_BITS_TLV: u64 = 65_545;
+const TAPROOT_ASSET_AUX_FEATURE_BITS_VALUE: [u8; 3] = [0, 1, 0x0a];
 
 pub const TAP_MESSAGE_TYPE_BASE_OFFSET: u16 = 32_768 + 20_116;
 pub const TAP_CHANNEL_MESSAGE_TYPE_OFFSET: u16 = TAP_MESSAGE_TYPE_BASE_OFFSET + 256;
@@ -722,6 +724,17 @@ impl TaprootAssetManager {
 		features
 	}
 
+	pub(crate) fn custom_init_tlvs(&self) -> Vec<(u64, Vec<u8>)> {
+		if self.config.negotiate_taproot_asset_channels {
+			vec![(
+				TAPROOT_ASSET_AUX_FEATURE_BITS_TLV,
+				TAPROOT_ASSET_AUX_FEATURE_BITS_VALUE.to_vec(),
+			)]
+		} else {
+			Vec::new()
+		}
+	}
+
 	fn persist_locked(&self, state: &TaprootAssetPersistedState) -> Result<(), TaprootAssetError> {
 		let raw = serde_json::to_vec(state).map_err(|_| TaprootAssetError::PersistenceFailed)?;
 		KVStoreSync::write(
@@ -912,6 +925,15 @@ mod tests {
 		assert!(features.supports_taproot_asset_channel());
 		assert!(!features.supports_static_remote_key());
 		assert!(!features.supports_channel_type());
+	}
+
+	#[test]
+	fn advertised_init_tlvs_include_lightning_labs_aux_features() {
+		let enabled = manager(true);
+		assert_eq!(enabled.custom_init_tlvs(), vec![(65_545, vec![0, 1, 0x0a])]);
+
+		let disabled = manager(false);
+		assert!(disabled.custom_init_tlvs().is_empty());
 	}
 
 	#[test]

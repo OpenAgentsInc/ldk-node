@@ -143,6 +143,17 @@ where
 		features
 	}
 
+	fn provided_init_tlvs(&self, their_node_id: PublicKey) -> Vec<(u64, Vec<u8>)> {
+		let mut tlvs = if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+			liquidity_source.liquidity_manager().provided_init_tlvs(their_node_id)
+		} else {
+			Vec::new()
+		};
+		tlvs.extend(self.taproot_asset_manager.custom_init_tlvs());
+		tlvs.sort_unstable_by_key(|(typ, _)| *typ);
+		tlvs
+	}
+
 	fn peer_connected(
 		&self, their_node_id: PublicKey, msg: &lightning::ln::msgs::Init, inbound: bool,
 	) -> Result<(), ()> {
