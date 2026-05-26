@@ -1509,7 +1509,6 @@ fn encode_asset(asset: &Asset) -> Result<Vec<u8>, TaprootAssetError> {
 fn encode_genesis_info(genesis: &GenesisInfo) -> Result<Vec<u8>, TaprootAssetError> {
 	let mut out = Vec::new();
 	encode_outpoint(&genesis.genesis_point, &mut out);
-	encode_outpoint(&genesis.genesis_point, &mut out);
 	encode_inline_var_bytes(genesis.name.as_bytes(), &mut out)?;
 	out.extend_from_slice(&genesis.meta_hash.to_byte_array());
 	out.extend_from_slice(&genesis.output_index.to_be_bytes());
@@ -1978,6 +1977,36 @@ mod tests {
 			)
 			.to_byte_array()
 		);
+	}
+
+	#[test]
+	fn genesis_encoding_matches_lightning_labs_asset_leaf_shape() {
+		let genesis = GenesisInfo {
+			genesis_point: BitcoinOutPoint {
+				txid: Txid::from_str(
+					"1111111111111111111111111111111111111111111111111111111111111111",
+				)
+				.unwrap(),
+				vout: 7,
+			},
+			name: "usd".to_owned(),
+			meta_hash: sha256::Hash::from_byte_array([0x22; 32]),
+			asset_id: sha256::Hash::from_byte_array([0x33; 32]),
+			asset_type: AssetType::Normal,
+			output_index: 9,
+		};
+
+		let encoded = encode_genesis_info(&genesis).unwrap();
+		let mut expected = Vec::new();
+		expected.extend_from_slice(&[0x11; 32]);
+		expected.extend_from_slice(&7u32.to_be_bytes());
+		expected.push(3);
+		expected.extend_from_slice(b"usd");
+		expected.extend_from_slice(&[0x22; 32]);
+		expected.extend_from_slice(&9u32.to_be_bytes());
+		expected.push(0);
+
+		assert_eq!(encoded, expected);
 	}
 
 	#[test]
