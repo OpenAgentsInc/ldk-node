@@ -10,8 +10,12 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use bitcoin::hashes::{sha256, Hash as _};
 use bitcoin::io::ErrorKind;
-use bitcoin::secp256k1::PublicKey;
+use bitcoin::key::TapTweak;
+use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1};
+use bitcoin::taproot::{LeafVersion, TapNodeHash};
+use bitcoin::ScriptBuf;
 use lightning::chain::transaction::OutPoint as LdkOutPoint;
 use lightning::ln::msgs::DecodeError;
 use lightning::ln::taproot_asset::{
@@ -27,10 +31,16 @@ use lightning::util::persist::KVStoreSync;
 use lightning::util::ser::{LengthLimitedRead, Writeable, Writer};
 use lightning_types::features::InitFeatures;
 use serde::{Deserialize, Serialize};
+use taproot_assets_core::verify::proof::verify_inclusion_proof;
+use taproot_assets_core::verify::taproot_proof::TapCommitment;
+use taproot_assets_core::{OpsError, TaprootOps};
+use taproot_assets_types::asset::SerializedKey;
+use taproot_assets_types::commitment::TapCommitmentVersion;
+use taproot_assets_types::proof::Proof as TaprootAssetProof;
 
 use crate::config::ExperimentalChannelConfig;
 use crate::hex_utils;
-use crate::types::DynStore;
+use crate::types::{ChannelManager, DynStore};
 
 const TAPROOT_ASSET_PRIMARY_NAMESPACE: &str = "taproot_asset";
 const TAPROOT_ASSET_SECONDARY_NAMESPACE: &str = "runtime";
@@ -275,6 +285,9 @@ pub enum TaprootAssetError {
 	DuplicatePayment,
 	MissingAssetMetadata,
 	MissingMonitorAuxState,
+	MissingChannelManager,
+	TaprootAssetProof(String),
+	ChannelManager(String),
 	LdkChannelState(TaprootAssetChannelStateError),
 	LdkHtlc(TaprootAssetHtlcMetadataError),
 	LdkMonitor(TaprootAssetMonitorAuxBlobError),
@@ -292,6 +305,11 @@ impl fmt::Display for TaprootAssetError {
 			Self::DuplicatePayment => write!(f, "duplicate Taproot Asset payment"),
 			Self::MissingAssetMetadata => write!(f, "missing Taproot Asset HTLC metadata"),
 			Self::MissingMonitorAuxState => write!(f, "missing Taproot Asset monitor aux state"),
+			Self::MissingChannelManager => {
+				write!(f, "missing Taproot Asset channel manager bridge")
+			},
+			Self::TaprootAssetProof(err) => write!(f, "Taproot Asset proof error: {err}"),
+			Self::ChannelManager(err) => write!(f, "LDK channel manager error: {err}"),
 			Self::LdkChannelState(err) => write!(f, "LDK Taproot Asset channel error: {err:?}"),
 			Self::LdkHtlc(err) => write!(f, "LDK Taproot Asset HTLC error: {err:?}"),
 			Self::LdkMonitor(err) => write!(f, "LDK Taproot Asset monitor error: {err:?}"),
@@ -357,12 +375,28 @@ pub(crate) struct TaprootAssetManager {
 	enabled: bool,
 	config: ExperimentalChannelConfig,
 	kv_store: Arc<DynStore>,
+	channel_manager: Option<Arc<ChannelManager>>,
 	state: Mutex<TaprootAssetPersistedState>,
 	pending_messages: Mutex<VecDeque<(PublicKey, TaprootAssetWireMessage)>>,
 }
 
 impl TaprootAssetManager {
+	#[cfg(test)]
 	pub(crate) fn new(config: ExperimentalChannelConfig, kv_store: Arc<DynStore>) -> Self {
+		Self::new_inner(config, kv_store, None)
+	}
+
+	pub(crate) fn with_channel_manager(
+		config: ExperimentalChannelConfig, kv_store: Arc<DynStore>,
+		channel_manager: Arc<ChannelManager>,
+	) -> Self {
+		Self::new_inner(config, kv_store, Some(channel_manager))
+	}
+
+	fn new_inner(
+		config: ExperimentalChannelConfig, kv_store: Arc<DynStore>,
+		channel_manager: Option<Arc<ChannelManager>>,
+	) -> Self {
 		let state = KVStoreSync::read(
 			&*kv_store,
 			TAPROOT_ASSET_PRIMARY_NAMESPACE,
@@ -376,6 +410,7 @@ impl TaprootAssetManager {
 			enabled: config.negotiate_taproot_asset_channels,
 			config,
 			kv_store,
+			channel_manager,
 			state: Mutex::new(state),
 			pending_messages: Mutex::new(VecDeque::new()),
 		}
@@ -412,6 +447,15 @@ impl TaprootAssetManager {
 			}
 		})?;
 
+		if msg.kind == TaprootAssetMessageKind::AssetFundingCreated {
+			self.bind_asset_funding_created(sender_node_id, &msg.payload).map_err(|err| {
+				lightning::ln::msgs::LightningError {
+					err: err.to_string(),
+					action: lightning::ln::msgs::ErrorAction::IgnoreError,
+				}
+			})?;
+		}
+
 		if let Some(ack_payload) = funding_ack_for_output_proof(&msg).map_err(|err| {
 			lightning::ln::msgs::LightningError {
 				err: err.to_string(),
@@ -436,6 +480,22 @@ impl TaprootAssetManager {
 		&self,
 	) -> Vec<(PublicKey, TaprootAssetWireMessage)> {
 		self.pending_messages.lock().expect("lock").drain(..).collect()
+	}
+
+	fn bind_asset_funding_created(
+		&self, sender_node_id: PublicKey, payload: &[u8],
+	) -> Result<(), TaprootAssetError> {
+		let fields = parse_asset_funding_created_fields(payload)?;
+		let tapscript_root = derive_asset_funding_tapscript_root(&fields.outputs)?;
+		let channel_manager =
+			self.channel_manager.as_ref().ok_or(TaprootAssetError::MissingChannelManager)?;
+		channel_manager
+			.set_pending_simple_taproot_tapscript_root(
+				ChannelId(fields.pending_channel_id),
+				sender_node_id,
+				tapscript_root,
+			)
+			.map_err(|err| TaprootAssetError::ChannelManager(format!("{err:?}")))
 	}
 
 	fn queue_message(
@@ -873,6 +933,204 @@ fn parse_asset_output_proof_fields(
 	})
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct AssetFundingCreatedFields {
+	pending_channel_id: [u8; TAPROOT_ASSET_ID_LEN],
+	outputs: Vec<AssetFundingOutputProof>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct AssetFundingOutputProof {
+	proof: TaprootAssetProof,
+}
+
+fn parse_asset_funding_created_fields(
+	payload: &[u8],
+) -> Result<AssetFundingCreatedFields, TaprootAssetError> {
+	let mut offset = 0usize;
+	let mut pending_channel_id = None;
+	let mut outputs = None;
+
+	while offset < payload.len() {
+		let record_type = read_bigsize(payload, &mut offset)?;
+		let record_len = read_bigsize(payload, &mut offset)?;
+		if record_len > usize::MAX as u64 {
+			return Err(TaprootAssetError::DecodeFailed);
+		}
+		let record_len = record_len as usize;
+		let record_end = offset.checked_add(record_len).ok_or(TaprootAssetError::DecodeFailed)?;
+		if record_end > payload.len() {
+			return Err(TaprootAssetError::DecodeFailed);
+		}
+		let record_value = &payload[offset..record_end];
+		offset = record_end;
+
+		match record_type {
+			0 if record_value.len() == TAPROOT_ASSET_ID_LEN => {
+				let mut id = [0u8; TAPROOT_ASSET_ID_LEN];
+				id.copy_from_slice(record_value);
+				pending_channel_id = Some(id);
+			},
+			1 => outputs = Some(parse_asset_output_list(record_value)?),
+			typ if typ % 2 == 1 => {},
+			_ => return Err(TaprootAssetError::DecodeFailed),
+		}
+	}
+
+	let outputs = outputs.ok_or(TaprootAssetError::DecodeFailed)?;
+	if outputs.is_empty() {
+		return Err(TaprootAssetError::DecodeFailed);
+	}
+	Ok(AssetFundingCreatedFields {
+		pending_channel_id: pending_channel_id.ok_or(TaprootAssetError::DecodeFailed)?,
+		outputs,
+	})
+}
+
+fn parse_asset_output_list(
+	payload: &[u8],
+) -> Result<Vec<AssetFundingOutputProof>, TaprootAssetError> {
+	let mut offset = 0usize;
+	let output_count = read_bigsize(payload, &mut offset)?;
+	if output_count == 0 || output_count > 16 {
+		return Err(TaprootAssetError::DecodeFailed);
+	}
+	let mut outputs = Vec::with_capacity(output_count as usize);
+	for _ in 0..output_count {
+		let output_len = read_bigsize(payload, &mut offset)?;
+		if output_len > usize::MAX as u64 {
+			return Err(TaprootAssetError::DecodeFailed);
+		}
+		let output_len = output_len as usize;
+		let output_end = offset.checked_add(output_len).ok_or(TaprootAssetError::DecodeFailed)?;
+		if output_end > payload.len() {
+			return Err(TaprootAssetError::DecodeFailed);
+		}
+		outputs.push(parse_asset_output(&payload[offset..output_end])?);
+		offset = output_end;
+	}
+	if offset != payload.len() {
+		return Err(TaprootAssetError::DecodeFailed);
+	}
+	Ok(outputs)
+}
+
+fn parse_asset_output(payload: &[u8]) -> Result<AssetFundingOutputProof, TaprootAssetError> {
+	let mut offset = 0usize;
+	let mut proof = None;
+
+	while offset < payload.len() {
+		let record_type = read_bigsize(payload, &mut offset)?;
+		let record_len = read_bigsize(payload, &mut offset)?;
+		if record_len > usize::MAX as u64 {
+			return Err(TaprootAssetError::DecodeFailed);
+		}
+		let record_len = record_len as usize;
+		let record_end = offset.checked_add(record_len).ok_or(TaprootAssetError::DecodeFailed)?;
+		if record_end > payload.len() {
+			return Err(TaprootAssetError::DecodeFailed);
+		}
+		let record_value = &payload[offset..record_end];
+		offset = record_end;
+
+		match record_type {
+			0 if record_value.len() == TAPROOT_ASSET_ID_LEN => {},
+			1 if record_value.len() == 8 => {},
+			2 => {
+				proof = Some(
+					TaprootAssetProof::from_bytes(record_value)
+						.map_err(|err| TaprootAssetError::TaprootAssetProof(err.to_string()))?,
+				);
+			},
+			typ if typ % 2 == 1 => {},
+			_ => return Err(TaprootAssetError::DecodeFailed),
+		}
+	}
+
+	Ok(AssetFundingOutputProof { proof: proof.ok_or(TaprootAssetError::DecodeFailed)? })
+}
+
+fn derive_asset_funding_tapscript_root(
+	outputs: &[AssetFundingOutputProof],
+) -> Result<[u8; 32], TaprootAssetError> {
+	let ops = BitcoinTaprootOps::new();
+	let mut root = None;
+	for output in outputs {
+		let commitment = verify_inclusion_proof(&ops, &output.proof)
+			.map_err(|err| TaprootAssetError::TaprootAssetProof(err.to_string()))?;
+		let candidate = tap_commitment_tapscript_root(&commitment);
+		match root {
+			Some(existing) if existing != candidate => {
+				return Err(TaprootAssetError::TaprootAssetProof(
+					"asset funding outputs disagree on tapscript root".to_owned(),
+				));
+			},
+			Some(_) => {},
+			None => root = Some(candidate),
+		}
+	}
+	root.ok_or(TaprootAssetError::DecodeFailed)
+}
+
+fn tap_commitment_tapscript_root(commitment: &TapCommitment) -> [u8; 32] {
+	let mut script = Vec::with_capacity(73);
+	match commitment.version {
+		TapCommitmentVersion::V0 | TapCommitmentVersion::V1 => {
+			script.push(commitment.version as u8);
+			script.extend_from_slice(&sha256::Hash::hash(b"taproot-assets").to_byte_array());
+			script.extend_from_slice(&commitment.root_hash);
+			script.extend_from_slice(&commitment.root_sum.to_be_bytes());
+		},
+		TapCommitmentVersion::V2 => {
+			script.extend_from_slice(&sha256::Hash::hash(b"taproot-assets:194243").to_byte_array());
+			script.push(commitment.version as u8);
+			script.extend_from_slice(&commitment.root_hash);
+			script.extend_from_slice(&commitment.root_sum.to_be_bytes());
+		},
+	}
+	TapNodeHash::from_script(ScriptBuf::from_bytes(script).as_script(), LeafVersion::TapScript)
+		.to_byte_array()
+}
+
+#[derive(Debug)]
+struct BitcoinTaprootOps {
+	secp: Secp256k1<bitcoin::secp256k1::VerifyOnly>,
+}
+
+impl BitcoinTaprootOps {
+	fn new() -> Self {
+		Self { secp: Secp256k1::verification_only() }
+	}
+}
+
+impl TaprootOps for BitcoinTaprootOps {
+	type PubKey = PublicKey;
+
+	fn parse_group_key(&self, key: &SerializedKey) -> Result<Self::PubKey, OpsError> {
+		PublicKey::from_slice(&key.bytes).map_err(|_| OpsError::InvalidRawGroupKey)
+	}
+
+	fn parse_internal_key(&self, key: &SerializedKey) -> Result<Self::PubKey, OpsError> {
+		PublicKey::from_slice(&key.bytes).map_err(|_| OpsError::InvalidInternalKey)
+	}
+
+	fn add_tweak(&self, pubkey: &Self::PubKey, tweak: [u8; 32]) -> Result<Self::PubKey, OpsError> {
+		let tweak = Scalar::from_be_bytes(tweak).map_err(|_| OpsError::AssetIdTweakOutOfRange)?;
+		pubkey.add_exp_tweak(&self.secp, &tweak).map_err(|_| OpsError::InvalidGroupKeyTweak)
+	}
+
+	fn taproot_output_key(
+		&self, internal_key: &Self::PubKey, tapscript_root: Option<[u8; 32]>,
+	) -> Result<SerializedKey, OpsError> {
+		let merkle_root = tapscript_root.map(TapNodeHash::from_byte_array);
+		let (xonly_key, _) = internal_key.x_only_public_key();
+		let (tweaked, parity) = xonly_key.tap_tweak(&self.secp, merkle_root);
+		let output_key = PublicKey::from_x_only_public_key(tweaked.to_x_only_public_key(), parity);
+
+		Ok(SerializedKey { bytes: output_key.serialize() })
+	}
+}
+
 fn encode_asset_funding_ack(
 	pending_channel_id: [u8; TAPROOT_ASSET_ID_LEN], accept: bool,
 ) -> Vec<u8> {
@@ -1068,6 +1326,31 @@ mod tests {
 		assert_eq!(&ack[..2], &[0, 32]);
 		assert_eq!(&ack[2..34], pending_channel_id.as_slice());
 		assert_eq!(&ack[34..], &[1, 1, 1]);
+	}
+
+	#[test]
+	fn tap_commitment_tapscript_root_uses_lightning_labs_leaf_shape() {
+		let commitment = TapCommitment {
+			version: TapCommitmentVersion::V2,
+			root_hash: nonzero(7),
+			root_sum: 42,
+		};
+		let root = tap_commitment_tapscript_root(&commitment);
+
+		let mut expected_script = Vec::new();
+		expected_script
+			.extend_from_slice(&sha256::Hash::hash(b"taproot-assets:194243").to_byte_array());
+		expected_script.push(2);
+		expected_script.extend_from_slice(&nonzero(7));
+		expected_script.extend_from_slice(&42u64.to_be_bytes());
+		assert_eq!(
+			root,
+			TapNodeHash::from_script(
+				ScriptBuf::from_bytes(expected_script).as_script(),
+				LeafVersion::TapScript
+			)
+			.to_byte_array()
+		);
 	}
 
 	#[test]

@@ -1940,9 +1940,10 @@ fn build_with_store_internal(
 	} else {
 		None
 	};
-	let taproot_asset_manager = Arc::new(TaprootAssetManager::new(
+	let taproot_asset_manager = Arc::new(TaprootAssetManager::with_channel_manager(
 		config.experimental_channel_config,
 		Arc::clone(&kv_store),
+		Arc::clone(&channel_manager),
 	));
 	let custom_message_handler = Arc::new(NodeCustomMessageHandler::new(
 		liquidity_source.clone(),
