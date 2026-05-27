@@ -50,7 +50,10 @@ const TAPROOT_ASSET_PRIMARY_NAMESPACE: &str = "taproot_asset";
 const TAPROOT_ASSET_SECONDARY_NAMESPACE: &str = "runtime";
 const TAPROOT_ASSET_STATE_KEY: &str = "state";
 const TAPROOT_ASSET_AUX_FEATURE_BITS_TLV: u64 = 65_545;
-const TAPROOT_ASSET_AUX_FEATURE_BITS_VALUE: [u8; 3] = [0, 1, 0x0a];
+// Lightning Labs' aux feature vector encodes optional feature bit 1 for
+// no-op HTLCs. Do not advertise optional STXO bit 3 until the fork actually
+// builds and verifies STXO leaves in Taproot Asset commitments.
+const TAPROOT_ASSET_AUX_FEATURE_BITS_VALUE: [u8; 3] = [0, 1, 0x02];
 
 pub const TAP_MESSAGE_TYPE_BASE_OFFSET: u16 = 32_768 + 20_116;
 pub const TAP_CHANNEL_MESSAGE_TYPE_OFFSET: u16 = TAP_MESSAGE_TYPE_BASE_OFFSET + 256;
@@ -2092,7 +2095,7 @@ mod tests {
 	#[test]
 	fn advertised_init_tlvs_include_lightning_labs_aux_features() {
 		let enabled = manager(true);
-		assert_eq!(enabled.custom_init_tlvs(), vec![(65_545, vec![0, 1, 0x0a])]);
+		assert_eq!(enabled.custom_init_tlvs(), vec![(65_545, vec![0, 1, 0x02])]);
 
 		let disabled = manager(false);
 		assert!(disabled.custom_init_tlvs().is_empty());
