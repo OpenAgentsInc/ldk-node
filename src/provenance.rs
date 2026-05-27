@@ -20,13 +20,16 @@ pub const LDK_NODE_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const RUST_LIGHTNING_FORK_URL: &str = "https://github.com/OpenAgentsInc/rust-lightning";
 
 /// The pinned OpenAgentsInc `rust-lightning` revision used by this fork.
-pub const RUST_LIGHTNING_FORK_REV: &str = "2f700eb3345964f4bb72dbb324b51329b005741d";
+pub const RUST_LIGHTNING_FORK_REV: &str = "128611e353004b9cbb8bc8b17de81f52a51cca30";
 
 /// Whether this fork is intentionally built against OpenAgentsInc `rust-lightning`.
 pub const USES_OPENAGENTS_RUST_LIGHTNING_FORK: bool = true;
 
 /// Whether the fork enables the `simple_taproot_musig2` LDK dependency feature.
 pub const SIMPLE_TAPROOT_MUSIG2_FEATURE_ENABLED: bool = true;
+
+/// Whether the fork enables the BOLT simple-close message path needed by simple-taproot channels.
+pub const SIMPLE_CLOSE_FEATURE_ENABLED: bool = true;
 
 /// Build provenance reported by the node runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,6 +46,8 @@ pub struct RuntimeProvenance {
 	pub uses_openagents_rust_lightning_fork: bool,
 	/// Whether the simple-taproot MuSig2 feature is enabled in the compiled runtime.
 	pub simple_taproot_musig2_feature_enabled: bool,
+	/// Whether the simple-close message path is enabled in the compiled runtime.
+	pub simple_close_feature_enabled: bool,
 }
 
 /// Returns the fork provenance for this build.
@@ -54,6 +59,7 @@ pub fn runtime_provenance() -> RuntimeProvenance {
 		rust_lightning_fork_rev: RUST_LIGHTNING_FORK_REV,
 		uses_openagents_rust_lightning_fork: USES_OPENAGENTS_RUST_LIGHTNING_FORK,
 		simple_taproot_musig2_feature_enabled: SIMPLE_TAPROOT_MUSIG2_FEATURE_ENABLED,
+		simple_close_feature_enabled: SIMPLE_CLOSE_FEATURE_ENABLED,
 	}
 }
 
@@ -72,5 +78,6 @@ mod tests {
 		assert_eq!(provenance.rust_lightning_fork_rev, RUST_LIGHTNING_FORK_REV);
 		assert!(provenance.uses_openagents_rust_lightning_fork);
 		assert!(provenance.simple_taproot_musig2_feature_enabled);
+		assert!(provenance.simple_close_feature_enabled);
 	}
 }
