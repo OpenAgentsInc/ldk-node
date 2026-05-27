@@ -1330,7 +1330,14 @@ fn derive_channel_asset_template(
 		None
 	};
 
-	TaprootAssetChannelAssetTemplate::new(
+	let previous_tx_witness = asset
+		.prev_witnesses
+		.first()
+		.filter(|witness| !witness.tx_witness.is_empty())
+		.map(|witness| encode_tx_witness(&witness.tx_witness))
+		.transpose()?;
+
+	TaprootAssetChannelAssetTemplate::new_with_previous_tx_witness(
 		output.asset_id,
 		output.amount,
 		genesis.genesis_point.txid.to_byte_array(),
@@ -1344,6 +1351,7 @@ fn derive_channel_asset_template(
 		previous_outpoint.txid.to_byte_array(),
 		previous_outpoint.vout,
 		previous_script_key,
+		previous_tx_witness,
 	)
 	.map_err(|err| {
 		TaprootAssetError::TaprootAssetProof(format!("asset channel template is invalid: {err:?}"))
@@ -1653,6 +1661,15 @@ fn encode_prev_witness(witness: &PrevWitness) -> Result<Vec<u8>, TaprootAssetErr
 	if let Some(prev_id) = witness.prev_id.as_ref() {
 		let bytes = encode_prev_id(prev_id);
 		encode_record(1, &bytes, &mut out)?;
+	}
+	Ok(out)
+}
+
+fn encode_tx_witness(witness: &Witness) -> Result<Vec<u8>, TaprootAssetError> {
+	let mut out = Vec::new();
+	push_bigsize(witness.len() as u64, &mut out)?;
+	for item in witness.iter() {
+		encode_inline_var_bytes(item, &mut out)?;
 	}
 	Ok(out)
 }
