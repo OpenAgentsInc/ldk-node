@@ -20,11 +20,12 @@ use lightning::chain::transaction::OutPoint as LdkOutPoint;
 use lightning::ln::chan_utils::SimpleTaprootAssetCommitmentOutputKeys;
 use lightning::ln::msgs::DecodeError;
 use lightning::ln::taproot_asset::{
-	single_asset_channel_type, TaprootAssetChannelDescriptor, TaprootAssetChannelState,
-	TaprootAssetChannelStateError, TaprootAssetFundingAllocation, TaprootAssetFundingExpectations,
-	TaprootAssetFundingOutput, TaprootAssetFundingProofMaterial, TaprootAssetFundingRequest,
-	TaprootAssetHtlcMetadata, TaprootAssetHtlcMetadataError, TaprootAssetHtlcMetadataExpectation,
-	TaprootAssetMonitorAuxBlob, TaprootAssetMonitorAuxBlobError, TAPROOT_ASSET_ID_LEN,
+	single_asset_channel_type, TaprootAssetChannelAssetTemplate, TaprootAssetChannelDescriptor,
+	TaprootAssetChannelState, TaprootAssetChannelStateError, TaprootAssetFundingAllocation,
+	TaprootAssetFundingExpectations, TaprootAssetFundingOutput, TaprootAssetFundingProofMaterial,
+	TaprootAssetFundingRequest, TaprootAssetHtlcMetadata, TaprootAssetHtlcMetadataError,
+	TaprootAssetHtlcMetadataExpectation, TaprootAssetMonitorAuxBlob,
+	TaprootAssetMonitorAuxBlobError, TAPROOT_ASSET_ID_LEN,
 };
 use lightning::ln::types::ChannelId;
 use lightning::ln::wire::Type;
@@ -502,8 +503,16 @@ impl TaprootAssetManager {
 	) -> Result<(), TaprootAssetError> {
 		let fields = parse_asset_funding_created_fields(payload)?;
 		let tapscript_root = derive_asset_funding_tapscript_root(&fields.outputs)?;
+		let channel_template = derive_channel_asset_template(&fields.outputs)?;
 		let channel_manager =
 			self.channel_manager.as_ref().ok_or(TaprootAssetError::MissingChannelManager)?;
+		channel_manager
+			.set_pending_taproot_asset_channel_template(
+				ChannelId(fields.pending_channel_id),
+				sender_node_id,
+				channel_template,
+			)
+			.map_err(|err| TaprootAssetError::ChannelManager(format!("{err:?}")))?;
 		channel_manager
 			.set_pending_simple_taproot_tapscript_root(
 				ChannelId(fields.pending_channel_id),
@@ -1268,6 +1277,77 @@ fn derive_asset_funding_tapscript_root(
 		}
 	}
 	root.ok_or(TaprootAssetError::DecodeFailed)
+}
+
+fn derive_channel_asset_template(
+	outputs: &[AssetFundingOutputProof],
+) -> Result<TaprootAssetChannelAssetTemplate, TaprootAssetError> {
+	if outputs.len() != 1 {
+		return Err(TaprootAssetError::TaprootAssetProof(
+			"Taproot Asset channel template currently supports exactly one funding output"
+				.to_owned(),
+		));
+	}
+	let output = &outputs[0];
+	let asset = &output.proof.asset;
+	let genesis = asset.asset_genesis.as_ref().ok_or(TaprootAssetError::DecodeFailed)?;
+	if genesis.asset_id.to_byte_array() != output.asset_id {
+		return Err(TaprootAssetError::TaprootAssetProof(
+			"asset funding output id disagrees with proof asset id".to_owned(),
+		));
+	}
+	if asset.amount != output.amount {
+		return Err(TaprootAssetError::TaprootAssetProof(
+			"asset funding output amount disagrees with proof asset amount".to_owned(),
+		));
+	}
+	if asset.script_key.len() != 33 {
+		return Err(TaprootAssetError::TaprootAssetProof(
+			"asset funding proof has invalid script key length".to_owned(),
+		));
+	}
+
+	let mut previous_script_key = [0u8; 33];
+	previous_script_key.copy_from_slice(&asset.script_key);
+	let previous_outpoint =
+		asset.chain_anchor.as_ref().map(|anchor| anchor.anchor_outpoint).unwrap_or_else(|| {
+			BitcoinOutPoint {
+				txid: output.proof.anchor_tx.compute_txid(),
+				vout: output.proof.inclusion_proof.output_index,
+			}
+		});
+
+	let group_key = if let Some(group) = asset.asset_group.as_ref() {
+		if group.raw_group_key.len() != 33 {
+			return Err(TaprootAssetError::TaprootAssetProof(
+				"asset raw group key has invalid length".to_owned(),
+			));
+		}
+		let mut raw_group_key = [0u8; 33];
+		raw_group_key.copy_from_slice(&group.raw_group_key);
+		Some(raw_group_key)
+	} else {
+		None
+	};
+
+	TaprootAssetChannelAssetTemplate::new(
+		output.asset_id,
+		output.amount,
+		genesis.genesis_point.txid.to_byte_array(),
+		genesis.genesis_point.vout,
+		genesis.name.as_bytes().to_vec(),
+		genesis.meta_hash.to_byte_array(),
+		genesis.output_index,
+		asset_type_byte(genesis.asset_type),
+		tap_commitment_key(asset)?,
+		group_key,
+		previous_outpoint.txid.to_byte_array(),
+		previous_outpoint.vout,
+		previous_script_key,
+	)
+	.map_err(|err| {
+		TaprootAssetError::TaprootAssetProof(format!("asset channel template is invalid: {err:?}"))
+	})
 }
 
 fn derive_initial_remote_owner_aux_leaves(
