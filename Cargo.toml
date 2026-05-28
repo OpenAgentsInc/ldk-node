@@ -40,18 +40,18 @@ default = []
 #lightning-macros = { version = "0.2.0" }
 #lightning-dns-resolver = { version = "0.3.0" }
 
-lightning = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b", features = ["std", "simple_taproot_musig2"] }
-lightning-types = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
-lightning-invoice = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b", features = ["std"] }
-lightning-net-tokio = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b", features = ["simple_taproot_musig2"] }
-lightning-persister = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b", features = ["tokio"] }
-lightning-background-processor = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
-lightning-rapid-gossip-sync = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
-lightning-block-sync = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b", features = ["rest-client", "rpc-client", "tokio"] }
-lightning-transaction-sync = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b", features = ["esplora-async-https", "time", "electrum-rustls-ring"] }
-lightning-liquidity = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b", features = ["std"] }
-lightning-macros = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
-lightning-dns-resolver = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
+lightning = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a", features = ["std", "simple_taproot_musig2"] }
+lightning-types = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
+lightning-invoice = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a", features = ["std"] }
+lightning-net-tokio = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a", features = ["simple_taproot_musig2"] }
+lightning-persister = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a", features = ["tokio"] }
+lightning-background-processor = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
+lightning-rapid-gossip-sync = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
+lightning-block-sync = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a", features = ["rest-client", "rpc-client", "tokio"] }
+lightning-transaction-sync = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a", features = ["esplora-async-https", "time", "electrum-rustls-ring"] }
+lightning-liquidity = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a", features = ["std"] }
+lightning-macros = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
+lightning-dns-resolver = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
 
 bdk_chain = { version = "0.23.0", default-features = false, features = ["std"] }
 bdk_esplora = { version = "0.22.0", default-features = false, features = ["async-https-rustls", "tokio"]}
@@ -89,7 +89,7 @@ bitcoin-payment-instructions = { git = "https://github.com/jkczyz/bitcoin-paymen
 winapi = { version = "0.3", features = ["winbase"] }
 
 [dev-dependencies]
-lightning = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b", features = ["std", "_test_utils", "simple_taproot_musig2"] }
+lightning = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a", features = ["std", "_test_utils", "simple_taproot_musig2"] }
 rand = { version = "0.9.2", default-features = false, features = ["std", "thread_rng", "os_rng"] }
 proptest = "1.0.0"
 regex = "1.5.6"
@@ -112,18 +112,18 @@ lnd_grpc_rust = { version = "2.14.0", default-features = false }
 tokio = { version = "1.37", features = ["fs"] }
 
 [patch."https://github.com/lightningdevkit/rust-lightning"]
-lightning = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
-lightning-types = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
-lightning-invoice = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
-lightning-net-tokio = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
-lightning-persister = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
-lightning-background-processor = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
-lightning-rapid-gossip-sync = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
-lightning-block-sync = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
-lightning-transaction-sync = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
-lightning-liquidity = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
-lightning-macros = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
-lightning-dns-resolver = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "3e8b6381715182383ec956a836379e63746c0d3b" }
+lightning = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
+lightning-types = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
+lightning-invoice = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
+lightning-net-tokio = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
+lightning-persister = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
+lightning-background-processor = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
+lightning-rapid-gossip-sync = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
+lightning-block-sync = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
+lightning-transaction-sync = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
+lightning-liquidity = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
+lightning-macros = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
+lightning-dns-resolver = { git = "https://github.com/OpenAgentsInc/rust-lightning", rev = "e486a0e829d06aa68e2ca596adb94c90cd19dd3a" }
 
 [build-dependencies]
 uniffi = { version = "0.29.5", features = ["build"], optional = true }
