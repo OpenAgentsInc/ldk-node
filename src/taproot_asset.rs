@@ -2108,13 +2108,18 @@ pub fn encode_taproot_asset_htlc_blob(
 		return Err(TaprootAssetError::InvalidChannelConfig);
 	}
 
+	let mut inner = Vec::new();
+	push_bigsize(0, &mut inner)?;
+	push_bigsize(asset_id.len() as u64, &mut inner)?;
+	inner.extend_from_slice(&asset_id);
+	push_bigsize(1, &mut inner)?;
+	push_bigsize(8, &mut inner)?;
+	inner.extend_from_slice(&asset_amount.to_be_bytes());
+
 	let mut blob = Vec::new();
-	push_bigsize(0, &mut blob)?;
-	push_bigsize(asset_id.len() as u64, &mut blob)?;
-	blob.extend_from_slice(&asset_id);
 	push_bigsize(1, &mut blob)?;
-	push_bigsize(8, &mut blob)?;
-	blob.extend_from_slice(&asset_amount.to_be_bytes());
+	push_bigsize(inner.len() as u64, &mut blob)?;
+	blob.extend_from_slice(&inner);
 	Ok(blob)
 }
 
@@ -2346,6 +2351,25 @@ mod tests {
 		assert_eq!(&ack[..2], &[0, 32]);
 		assert_eq!(&ack[2..34], pending_channel_id.as_slice());
 		assert_eq!(&ack[34..], &[1, 1, 1]);
+	}
+
+	#[test]
+	fn taproot_asset_htlc_blob_matches_lightning_labs_outer_tlv_shape() {
+		let asset_id = nonzero(7);
+		let asset_amount = 125u64;
+
+		let blob = encode_taproot_asset_htlc_blob(asset_id, asset_amount).unwrap();
+
+		let mut expected = Vec::new();
+		expected.extend_from_slice(&[1, 44, 0, 32]);
+		expected.extend_from_slice(&asset_id);
+		expected.extend_from_slice(&[1, 8]);
+		expected.extend_from_slice(&asset_amount.to_be_bytes());
+		assert_eq!(blob, expected);
+
+		let decoded = decode_taproot_asset_htlc_blob(&blob).unwrap();
+		assert_eq!(decoded.asset_id, asset_id);
+		assert_eq!(decoded.asset_amount, asset_amount);
 	}
 
 	#[test]
