@@ -20,7 +20,7 @@ pub const LDK_NODE_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const RUST_LIGHTNING_FORK_URL: &str = "https://github.com/OpenAgentsInc/rust-lightning";
 
 /// The pinned OpenAgentsInc `rust-lightning` revision used by this fork.
-pub const RUST_LIGHTNING_FORK_REV: &str = "d55a4ee524d6f60005ec1ef3309aefd6fe3fc5cf";
+pub const RUST_LIGHTNING_FORK_REV: &str = "3e8b6381715182383ec956a836379e63746c0d3b";
 
 /// Whether this fork is intentionally built against OpenAgentsInc `rust-lightning`.
 pub const USES_OPENAGENTS_RUST_LIGHTNING_FORK: bool = true;
