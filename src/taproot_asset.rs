@@ -2099,6 +2099,25 @@ fn push_bigsize(value: u64, out: &mut Vec<u8>) -> Result<(), TaprootAssetError> 
 	Ok(())
 }
 
+/// Encode the minimal Lightning Labs-compatible Taproot Asset HTLC blob used by the
+/// proof-of-concept live keysend path.
+pub fn encode_taproot_asset_htlc_blob(
+	asset_id: [u8; TAPROOT_ASSET_ID_LEN], asset_amount: u64,
+) -> Result<Vec<u8>, TaprootAssetError> {
+	if asset_amount == 0 {
+		return Err(TaprootAssetError::InvalidChannelConfig);
+	}
+
+	let mut blob = Vec::new();
+	push_bigsize(0, &mut blob)?;
+	push_bigsize(asset_id.len() as u64, &mut blob)?;
+	blob.extend_from_slice(&asset_id);
+	push_bigsize(1, &mut blob)?;
+	push_bigsize(8, &mut blob)?;
+	blob.extend_from_slice(&asset_amount.to_be_bytes());
+	Ok(blob)
+}
+
 fn read_fixed<const N: usize>(
 	payload: &[u8], offset: &mut usize,
 ) -> Result<[u8; N], TaprootAssetError> {
@@ -2162,14 +2181,7 @@ mod tests {
 	}
 
 	fn live_htlc_blob(asset_id: [u8; 32], asset_amount: u64) -> Vec<u8> {
-		let mut blob = Vec::new();
-		push_bigsize(0, &mut blob).unwrap();
-		push_bigsize(asset_id.len() as u64, &mut blob).unwrap();
-		blob.extend_from_slice(&asset_id);
-		push_bigsize(1, &mut blob).unwrap();
-		push_bigsize(8, &mut blob).unwrap();
-		blob.extend_from_slice(&asset_amount.to_be_bytes());
-		blob
+		encode_taproot_asset_htlc_blob(asset_id, asset_amount).unwrap()
 	}
 
 	fn live_claimed_htlc(channel_id: [u8; 32], asset_amount: u64) -> ClaimedHTLC {

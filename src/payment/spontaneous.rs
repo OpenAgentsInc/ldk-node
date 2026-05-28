@@ -54,7 +54,7 @@ impl SpontaneousPayment {
 	fn send_inner(
 		&self, amount_msat: u64, node_id: PublicKey,
 		route_parameters: Option<RouteParametersConfig>, custom_tlvs: Option<Vec<CustomTlvRecord>>,
-		preimage: Option<PaymentPreimage>,
+		preimage: Option<PaymentPreimage>, taproot_asset_htlc_blob: Option<Vec<u8>>,
 	) -> Result<PaymentId, Error> {
 		if !*self.is_running.read().expect("lock") {
 			return Err(Error::NotRunning);
@@ -93,6 +93,9 @@ impl SpontaneousPayment {
 			route_params.payment_params.max_channel_saturation_power_of_half =
 				*max_channel_saturation_power_of_half;
 		}
+		if taproot_asset_htlc_blob.is_some() {
+			route_params.payment_params.max_path_count = 1;
+		}
 
 		let mut recipient_fields = RecipientOnionFields::spontaneous_empty(amount_msat);
 		if let Some(tlvs) = custom_tlvs {
@@ -108,13 +111,26 @@ impl SpontaneousPayment {
 			);
 		}
 
-		match self.channel_manager.send_spontaneous_payment(
-			Some(payment_preimage),
-			recipient_fields,
-			PaymentId(payment_hash.0),
-			route_params,
-			Retry::Timeout(LDK_PAYMENT_RETRY_TIMEOUT),
-		) {
+		let send_result = if let Some(blob) = taproot_asset_htlc_blob {
+			self.channel_manager.send_spontaneous_payment_with_taproot_asset_htlc_blob(
+				Some(payment_preimage),
+				recipient_fields,
+				PaymentId(payment_hash.0),
+				route_params,
+				Retry::Attempts(0),
+				blob,
+			)
+		} else {
+			self.channel_manager.send_spontaneous_payment(
+				Some(payment_preimage),
+				recipient_fields,
+				PaymentId(payment_hash.0),
+				route_params,
+				Retry::Timeout(LDK_PAYMENT_RETRY_TIMEOUT),
+			)
+		};
+
+		match send_result {
 			Ok(_hash) => {
 				log_info!(self.logger, "Initiated sending {}msat to {}.", amount_msat, node_id);
 
@@ -172,7 +188,7 @@ impl SpontaneousPayment {
 		&self, amount_msat: u64, node_id: PublicKey,
 		route_parameters: Option<RouteParametersConfig>,
 	) -> Result<PaymentId, Error> {
-		self.send_inner(amount_msat, node_id, route_parameters, None, None)
+		self.send_inner(amount_msat, node_id, route_parameters, None, None, None)
 	}
 
 	/// Send a spontaneous payment including a list of custom TLVs.
@@ -180,7 +196,25 @@ impl SpontaneousPayment {
 		&self, amount_msat: u64, node_id: PublicKey,
 		route_parameters: Option<RouteParametersConfig>, custom_tlvs: Vec<CustomTlvRecord>,
 	) -> Result<PaymentId, Error> {
-		self.send_inner(amount_msat, node_id, route_parameters, Some(custom_tlvs), None)
+		self.send_inner(amount_msat, node_id, route_parameters, Some(custom_tlvs), None, None)
+	}
+
+	/// Send a spontaneous payment carrying a Taproot Asset HTLC blob on the Lightning HTLC.
+	///
+	/// This experimental method is limited to single-path sends and disables automatic retries so
+	/// the asset blob cannot be replayed across a different route.
+	pub fn send_with_taproot_asset_htlc_blob(
+		&self, amount_msat: u64, node_id: PublicKey,
+		route_parameters: Option<RouteParametersConfig>, taproot_asset_htlc_blob: Vec<u8>,
+	) -> Result<PaymentId, Error> {
+		self.send_inner(
+			amount_msat,
+			node_id,
+			route_parameters,
+			None,
+			None,
+			Some(taproot_asset_htlc_blob),
+		)
 	}
 
 	/// Send a spontaneous payment with custom preimage
@@ -188,7 +222,7 @@ impl SpontaneousPayment {
 		&self, amount_msat: u64, node_id: PublicKey, preimage: PaymentPreimage,
 		route_parameters: Option<RouteParametersConfig>,
 	) -> Result<PaymentId, Error> {
-		self.send_inner(amount_msat, node_id, route_parameters, None, Some(preimage))
+		self.send_inner(amount_msat, node_id, route_parameters, None, Some(preimage), None)
 	}
 
 	/// Send a spontaneous payment with custom preimage including a list of custom TLVs.
@@ -196,7 +230,14 @@ impl SpontaneousPayment {
 		&self, amount_msat: u64, node_id: PublicKey, custom_tlvs: Vec<CustomTlvRecord>,
 		preimage: PaymentPreimage, route_parameters: Option<RouteParametersConfig>,
 	) -> Result<PaymentId, Error> {
-		self.send_inner(amount_msat, node_id, route_parameters, Some(custom_tlvs), Some(preimage))
+		self.send_inner(
+			amount_msat,
+			node_id,
+			route_parameters,
+			Some(custom_tlvs),
+			Some(preimage),
+			None,
+		)
 	}
 
 	/// Sends payment probes over all paths of a route that would be used to pay the given
