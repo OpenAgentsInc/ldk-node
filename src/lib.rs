@@ -595,6 +595,7 @@ impl Node {
 			Arc::clone(&self.network_graph),
 			self.liquidity_source.clone(),
 			Arc::clone(&self.payment_store),
+			Arc::clone(&self.taproot_asset_manager),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.keys_manager),
 			static_invoice_store,

@@ -51,6 +51,7 @@ use crate::payment::store::{
 	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
 };
 use crate::runtime::Runtime;
+use crate::taproot_asset::TaprootAssetManager;
 use crate::types::{
 	CustomTlvRecord, DynStore, KeysManager, OnionMessenger, PaymentStore, Sweeper, Wallet,
 };
@@ -534,6 +535,7 @@ where
 	network_graph: Arc<Graph>,
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 	payment_store: Arc<PaymentStore>,
+	taproot_asset_manager: Arc<TaprootAssetManager>,
 	peer_store: Arc<PeerStore<L>>,
 	keys_manager: Arc<KeysManager>,
 	runtime: Arc<Runtime>,
@@ -554,10 +556,11 @@ where
 		channel_manager: Arc<ChannelManager>, connection_manager: Arc<ConnectionManager<L>>,
 		output_sweeper: Arc<Sweeper>, network_graph: Arc<Graph>,
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
-		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<L>>,
-		keys_manager: Arc<KeysManager>, static_invoice_store: Option<StaticInvoiceStore>,
-		onion_messenger: Arc<OnionMessenger>, om_mailbox: Option<Arc<OnionMessageMailbox>>,
-		runtime: Arc<Runtime>, logger: L, config: Arc<Config>,
+		payment_store: Arc<PaymentStore>, taproot_asset_manager: Arc<TaprootAssetManager>,
+		peer_store: Arc<PeerStore<L>>, keys_manager: Arc<KeysManager>,
+		static_invoice_store: Option<StaticInvoiceStore>, onion_messenger: Arc<OnionMessenger>,
+		om_mailbox: Option<Arc<OnionMessageMailbox>>, runtime: Arc<Runtime>, logger: L,
+		config: Arc<Config>,
 	) -> Self {
 		Self {
 			event_queue,
@@ -569,6 +572,7 @@ where
 			network_graph,
 			liquidity_source,
 			payment_store,
+			taproot_asset_manager,
 			peer_store,
 			keys_manager,
 			logger,
@@ -993,7 +997,7 @@ where
 				purpose,
 				amount_msat,
 				receiver_node_id: _,
-				htlcs: _,
+				htlcs,
 				sender_intended_total_msat: _,
 				onion_fields,
 				payment_id: _,
@@ -1068,6 +1072,19 @@ where
 						);
 						return Err(ReplayEvent());
 					},
+				}
+
+				if let Err(err) = self
+					.taproot_asset_manager
+					.record_live_inbound_payment_claimed(payment_hash.0, &htlcs)
+				{
+					log_error!(
+						self.logger,
+						"Failed to record Taproot Asset payment claim {}: {}",
+						hex_utils::to_string(&payment_hash.0),
+						err
+					);
+					return Err(ReplayEvent());
 				}
 
 				let event = Event::PaymentReceived {
@@ -1483,6 +1500,21 @@ where
 				let former_temporary_channel_id = former_temporary_channel_id.expect(
 					"LDK Node has only ever persisted ChannelPending events from rust-lightning 0.0.115 or later",
 				);
+				if let Err(err) = self.taproot_asset_manager.bind_live_channel_pending(
+					former_temporary_channel_id,
+					channel_id,
+					counterparty_node_id,
+					funding_txo.clone(),
+				) {
+					log_error!(
+						self.logger,
+						"Failed to bind pending Taproot Asset channel {} from temporary channel {}: {}",
+						channel_id,
+						former_temporary_channel_id,
+						err
+					);
+					return Err(ReplayEvent());
+				}
 
 				let event = Event::ChannelPending {
 					channel_id,

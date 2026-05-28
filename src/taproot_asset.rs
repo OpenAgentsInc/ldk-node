@@ -17,14 +17,15 @@ use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1};
 use bitcoin::taproot::{LeafVersion, TapNodeHash};
 use bitcoin::{OutPoint as BitcoinOutPoint, ScriptBuf, Witness};
 use lightning::chain::transaction::OutPoint as LdkOutPoint;
+use lightning::events::ClaimedHTLC;
 use lightning::ln::chan_utils::SimpleTaprootAssetCommitmentOutputKeys;
 use lightning::ln::msgs::DecodeError;
 use lightning::ln::taproot_asset::{
-	single_asset_channel_type, TaprootAssetChannelAssetTemplate, TaprootAssetChannelDescriptor,
-	TaprootAssetChannelState, TaprootAssetChannelStateError, TaprootAssetFundingAllocation,
-	TaprootAssetFundingExpectations, TaprootAssetFundingOutput, TaprootAssetFundingProofMaterial,
-	TaprootAssetFundingRequest, TaprootAssetHtlcMetadata, TaprootAssetHtlcMetadataError,
-	TaprootAssetHtlcMetadataExpectation, TaprootAssetMonitorAuxBlob,
+	decode_taproot_asset_htlc_blob, single_asset_channel_type, TaprootAssetChannelAssetTemplate,
+	TaprootAssetChannelDescriptor, TaprootAssetChannelState, TaprootAssetChannelStateError,
+	TaprootAssetFundingAllocation, TaprootAssetFundingExpectations, TaprootAssetFundingOutput,
+	TaprootAssetFundingProofMaterial, TaprootAssetFundingRequest, TaprootAssetHtlcMetadata,
+	TaprootAssetHtlcMetadataError, TaprootAssetHtlcMetadataExpectation, TaprootAssetMonitorAuxBlob,
 	TaprootAssetMonitorAuxBlobError, TAPROOT_ASSET_ID_LEN,
 };
 use lightning::ln::types::ChannelId;
@@ -228,6 +229,20 @@ pub struct TaprootAssetPaymentStatus {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct TaprootAssetPendingChannelStatus {
+	pending_channel_id: String,
+	counterparty_node_id: String,
+	asset_id: [u8; TAPROOT_ASSET_ID_LEN],
+	local_balance: u64,
+	remote_balance: u64,
+	total_amount: u64,
+	proof_root_hash: [u8; TAPROOT_ASSET_ID_LEN],
+	proof_root_sum: u64,
+	funding_accepted: bool,
+	monitor_aux_persisted: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaprootAssetRuntimeEvent {
 	MessageReceived {
 		sender_node_id: String,
@@ -275,6 +290,8 @@ pub enum TaprootAssetRuntimeEvent {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 struct TaprootAssetPersistedState {
 	channels: BTreeMap<String, TaprootAssetChannelStatus>,
+	#[serde(default)]
+	pending_channels: BTreeMap<String, TaprootAssetPendingChannelStatus>,
 	payments: BTreeMap<String, TaprootAssetPaymentStatus>,
 	received_messages: Vec<TaprootAssetReceivedMessage>,
 	events: Vec<TaprootAssetRuntimeEvent>,
@@ -284,6 +301,7 @@ impl Default for TaprootAssetPersistedState {
 	fn default() -> Self {
 		Self {
 			channels: BTreeMap::new(),
+			pending_channels: BTreeMap::new(),
 			payments: BTreeMap::new(),
 			received_messages: Vec::new(),
 			events: Vec::new(),
@@ -504,6 +522,9 @@ impl TaprootAssetManager {
 		let fields = parse_asset_funding_created_fields(payload)?;
 		let tapscript_root = derive_asset_funding_tapscript_root(&fields.outputs)?;
 		let channel_template = derive_channel_asset_template(&fields.outputs)?;
+		let funding_commitment = derive_channel_funding_commitment(&fields.outputs)?;
+		let asset_id = *channel_template.asset_id();
+		let total_amount = channel_template.total_amount();
 		let channel_manager =
 			self.channel_manager.as_ref().ok_or(TaprootAssetError::MissingChannelManager)?;
 		channel_manager
@@ -544,8 +565,24 @@ impl TaprootAssetManager {
 			.map_err(|err| TaprootAssetError::ChannelManager(format!("{err:?}")))?;
 
 		let mut state = self.state.lock().expect("lock");
+		let pending_channel_id = hex_utils::to_string(&fields.pending_channel_id);
+		state.pending_channels.insert(
+			pending_channel_id.clone(),
+			TaprootAssetPendingChannelStatus {
+				pending_channel_id: pending_channel_id.clone(),
+				counterparty_node_id: sender_node_id.to_string(),
+				asset_id,
+				local_balance: 0,
+				remote_balance: total_amount,
+				total_amount,
+				proof_root_hash: funding_commitment.root_hash,
+				proof_root_sum: funding_commitment.root_sum,
+				funding_accepted: false,
+				monitor_aux_persisted: true,
+			},
+		);
 		state.events.push(TaprootAssetRuntimeEvent::FundingAuxLeavesBound {
-			pending_channel_id: hex_utils::to_string(&fields.pending_channel_id),
+			pending_channel_id,
 			funding_tapscript_root: hex_utils::to_string(&tapscript_root),
 			holder_commitment_to_counterparty_output_key: hex_utils::to_string(
 				&output_keys.holder_commitment_to_counterparty,
@@ -556,6 +593,162 @@ impl TaprootAssetManager {
 			holder_commitment_to_counterparty_aux_leaf_script,
 			counterparty_commitment_to_counterparty_aux_leaf_script,
 		});
+		self.persist_locked(&state)
+	}
+
+	pub(crate) fn bind_live_channel_pending(
+		&self, former_temporary_channel_id: ChannelId, channel_id: ChannelId,
+		counterparty_node_id: PublicKey, funding_txo: BitcoinOutPoint,
+	) -> Result<(), TaprootAssetError> {
+		if !self.enabled {
+			return Ok(());
+		}
+
+		let pending_key = hex_utils::to_string(&former_temporary_channel_id.0);
+		let channel_key = hex_utils::to_string(&channel_id.0);
+		let mut state = self.state.lock().expect("lock");
+		let Some(mut pending) = state.pending_channels.remove(&pending_key) else {
+			return Ok(());
+		};
+		if state.channels.contains_key(&channel_key) {
+			return Ok(());
+		}
+		if pending.counterparty_node_id != counterparty_node_id.to_string() {
+			state.pending_channels.insert(pending_key, pending);
+			return Err(TaprootAssetError::InvalidChannelConfig);
+		}
+		pending.funding_accepted = true;
+		let status = TaprootAssetChannelStatus {
+			channel_id: channel_key.clone(),
+			counterparty_node_id: counterparty_node_id.to_string(),
+			funding_outpoint: funding_txo.to_string(),
+			asset_id: pending.asset_id,
+			local_balance: pending.local_balance,
+			remote_balance: pending.remote_balance,
+			total_amount: pending.total_amount,
+			proof_root_hash: pending.proof_root_hash,
+			proof_root_sum: pending.proof_root_sum,
+			latest_commitment_number: 0,
+			funding_accepted: pending.funding_accepted,
+			monitor_aux_persisted: pending.monitor_aux_persisted,
+			closed: false,
+		};
+		state.channels.insert(channel_key.clone(), status);
+		state.events.push(TaprootAssetRuntimeEvent::FundingAccepted {
+			channel_id: channel_key,
+			asset_id: pending.asset_id,
+			total_amount: pending.total_amount,
+		});
+		self.persist_locked(&state)
+	}
+
+	pub(crate) fn record_live_inbound_payment_claimed(
+		&self, payment_hash: [u8; TAPROOT_ASSET_ID_LEN], htlcs: &[ClaimedHTLC],
+	) -> Result<(), TaprootAssetError> {
+		if !self.enabled {
+			return Ok(());
+		}
+
+		let mut channel_id = None;
+		let mut asset_id = None;
+		let mut asset_amount = 0u64;
+		for htlc in htlcs {
+			let Some(blob) = htlc.taproot_asset_htlc_blob.as_ref() else {
+				continue;
+			};
+			let decoded = decode_taproot_asset_htlc_blob(blob)
+				.map_err(|_| TaprootAssetError::DecodeFailed)?;
+			match channel_id {
+				Some(existing) if existing != htlc.channel_id => {
+					return Err(TaprootAssetError::InvalidChannelConfig);
+				},
+				Some(_) => {},
+				None => channel_id = Some(htlc.channel_id),
+			}
+			match asset_id {
+				Some(existing) if existing != decoded.asset_id => {
+					return Err(TaprootAssetError::InvalidChannelConfig);
+				},
+				Some(_) => {},
+				None => asset_id = Some(decoded.asset_id),
+			}
+			asset_amount = asset_amount
+				.checked_add(decoded.asset_amount)
+				.ok_or(TaprootAssetError::InvalidChannelConfig)?;
+		}
+		let Some(channel_id) = channel_id else {
+			return Ok(());
+		};
+		let asset_id = asset_id.ok_or(TaprootAssetError::InvalidChannelConfig)?;
+		if asset_amount == 0 {
+			return Err(TaprootAssetError::InvalidChannelConfig);
+		}
+
+		let channel_key = hex_utils::to_string(&channel_id.0);
+		let payment_id = hex_utils::to_string(&payment_hash);
+		let mut state = self.state.lock().expect("lock");
+		if let Some(existing) = state.payments.get(&payment_id) {
+			if existing.channel_id == channel_key
+				&& existing.asset_id == asset_id
+				&& existing.asset_amount == asset_amount
+				&& existing.status == "settled"
+			{
+				return Ok(());
+			}
+			return Err(TaprootAssetError::DuplicatePayment);
+		}
+
+		let mut channel =
+			state.channels.get(&channel_key).cloned().ok_or(TaprootAssetError::UnknownChannel)?;
+		if channel.asset_id != asset_id {
+			return Err(TaprootAssetError::InvalidChannelConfig);
+		}
+		let local_balance = channel
+			.local_balance
+			.checked_add(asset_amount)
+			.ok_or(TaprootAssetError::InvalidChannelConfig)?;
+		let remote_balance = channel
+			.remote_balance
+			.checked_sub(asset_amount)
+			.ok_or(TaprootAssetError::InvalidChannelConfig)?;
+		let next_commitment = channel
+			.latest_commitment_number
+			.checked_add(1)
+			.ok_or(TaprootAssetError::InvalidChannelConfig)?;
+		channel.local_balance = local_balance;
+		channel.remote_balance = remote_balance;
+		channel.latest_commitment_number = next_commitment;
+		channel.monitor_aux_persisted = true;
+
+		let status = TaprootAssetPaymentStatus {
+			payment_id: payment_id.clone(),
+			channel_id: channel_key.clone(),
+			direction: "remote_to_local".to_owned(),
+			asset_id,
+			asset_amount,
+			quote_id: [0; TAPROOT_ASSET_ID_LEN],
+			payment_hash,
+			status: "settled".to_owned(),
+			latest_commitment_number: next_commitment,
+			local_balance_after: local_balance,
+			remote_balance_after: remote_balance,
+		};
+		state.channels.insert(channel_key.clone(), channel);
+		state.payments.insert(payment_id.clone(), status);
+		state.events.push(TaprootAssetRuntimeEvent::HtlcAdded {
+			payment_id: payment_id.clone(),
+			channel_id: channel_key.clone(),
+			asset_amount,
+		});
+		state.events.push(TaprootAssetRuntimeEvent::CommitmentAdvanced {
+			channel_id: channel_key.clone(),
+			commitment_number: next_commitment,
+			local_balance,
+			remote_balance,
+		});
+		state
+			.events
+			.push(TaprootAssetRuntimeEvent::HtlcSettled { payment_id, channel_id: channel_key });
 		self.persist_locked(&state)
 	}
 
@@ -1279,6 +1472,20 @@ fn derive_asset_funding_tapscript_root(
 	root.ok_or(TaprootAssetError::DecodeFailed)
 }
 
+fn derive_channel_funding_commitment(
+	outputs: &[AssetFundingOutputProof],
+) -> Result<TapCommitment, TaprootAssetError> {
+	if outputs.len() != 1 {
+		return Err(TaprootAssetError::TaprootAssetProof(
+			"Taproot Asset channel funding commitment currently supports exactly one funding output"
+				.to_owned(),
+		));
+	}
+	let ops = BitcoinTaprootOps::new();
+	verify_inclusion_proof(&ops, &outputs[0].proof)
+		.map_err(|err| TaprootAssetError::TaprootAssetProof(err.to_string()))
+}
+
 fn derive_channel_asset_template(
 	outputs: &[AssetFundingOutputProof],
 ) -> Result<TaprootAssetChannelAssetTemplate, TaprootAssetError> {
@@ -1917,13 +2124,81 @@ mod tests {
 
 	use super::*;
 
-	fn manager(enabled: bool) -> Arc<TaprootAssetManager> {
-		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
-		let config = ExperimentalChannelConfig {
+	fn test_config(enabled: bool) -> ExperimentalChannelConfig {
+		ExperimentalChannelConfig {
 			negotiate_simple_taproot_channels: enabled,
 			negotiate_taproot_asset_channels: enabled,
-		};
-		Arc::new(TaprootAssetManager::new(config, store))
+		}
+	}
+
+	fn manager_with_store(enabled: bool, store: Arc<DynStore>) -> Arc<TaprootAssetManager> {
+		Arc::new(TaprootAssetManager::new(test_config(enabled), store))
+	}
+
+	fn manager(enabled: bool) -> Arc<TaprootAssetManager> {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		manager_with_store(enabled, store)
+	}
+
+	fn store() -> Arc<DynStore> {
+		Arc::new(DynStoreWrapper(InMemoryStore::new()))
+	}
+
+	fn live_pending_channel(
+		pending_channel_id: [u8; 32], counterparty_node_id: PublicKey,
+	) -> TaprootAssetPendingChannelStatus {
+		TaprootAssetPendingChannelStatus {
+			pending_channel_id: hex_utils::to_string(&pending_channel_id),
+			counterparty_node_id: counterparty_node_id.to_string(),
+			asset_id: nonzero(7),
+			local_balance: 0,
+			remote_balance: 300,
+			total_amount: 300,
+			proof_root_hash: nonzero(9),
+			proof_root_sum: 300,
+			funding_accepted: false,
+			monitor_aux_persisted: true,
+		}
+	}
+
+	fn live_htlc_blob(asset_id: [u8; 32], asset_amount: u64) -> Vec<u8> {
+		let mut blob = Vec::new();
+		push_bigsize(0, &mut blob).unwrap();
+		push_bigsize(asset_id.len() as u64, &mut blob).unwrap();
+		blob.extend_from_slice(&asset_id);
+		push_bigsize(1, &mut blob).unwrap();
+		push_bigsize(8, &mut blob).unwrap();
+		blob.extend_from_slice(&asset_amount.to_be_bytes());
+		blob
+	}
+
+	fn live_claimed_htlc(channel_id: [u8; 32], asset_amount: u64) -> ClaimedHTLC {
+		ClaimedHTLC {
+			counterparty_node_id: Some(peer(2)),
+			channel_id: ChannelId(channel_id),
+			user_channel_id: 0,
+			cltv_expiry: 42,
+			value_msat: 1_000,
+			counterparty_skimmed_fee_msat: 0,
+			taproot_asset_htlc_blob: Some(live_htlc_blob(nonzero(7), asset_amount)),
+		}
+	}
+
+	fn live_funding_outpoint() -> BitcoinOutPoint {
+		BitcoinOutPoint {
+			txid: Txid::from_str(
+				"2222222222222222222222222222222222222222222222222222222222222222",
+			)
+			.unwrap(),
+			vout: 1,
+		}
+	}
+
+	fn open_remote_funded_channel(manager: &TaprootAssetManager) {
+		let mut request = open_request();
+		request.local_amount = 0;
+		request.remote_amount = 1_000;
+		manager.open_channel(peer(2), request).unwrap();
 	}
 
 	fn peer(seed: u8) -> PublicKey {
@@ -2210,6 +2485,42 @@ mod tests {
 	}
 
 	#[test]
+	fn live_pending_channel_binding_persists_native_asset_channel() {
+		let store = store();
+		let manager = manager_with_store(true, Arc::clone(&store));
+		let pending_channel_id = nonzero(5);
+		let final_channel_id = nonzero(6);
+		{
+			let mut state = manager.state.lock().expect("lock");
+			state.pending_channels.insert(
+				hex_utils::to_string(&pending_channel_id),
+				live_pending_channel(pending_channel_id, peer(2)),
+			);
+			manager.persist_locked(&state).unwrap();
+		}
+
+		manager
+			.bind_live_channel_pending(
+				ChannelId(pending_channel_id),
+				ChannelId(final_channel_id),
+				peer(2),
+				live_funding_outpoint(),
+			)
+			.unwrap();
+
+		let channels = manager.list_channels();
+		assert_eq!(channels.len(), 1);
+		assert_eq!(channels[0].channel_id, hex_utils::to_string(&final_channel_id));
+		assert_eq!(channels[0].local_balance, 0);
+		assert_eq!(channels[0].remote_balance, 300);
+		assert!(channels[0].funding_accepted);
+		assert!(manager.state.lock().expect("lock").pending_channels.is_empty());
+
+		let reloaded = TaprootAssetManager::new(test_config(true), store);
+		assert_eq!(reloaded.list_channels(), channels);
+	}
+
+	#[test]
 	fn payment_reaches_ldk_htlc_and_commitment_hooks() {
 		let manager = manager(true);
 		manager.open_channel(peer(2), open_request()).unwrap();
@@ -2221,6 +2532,46 @@ mod tests {
 		assert_eq!(status.local_balance_after, 575);
 		assert_eq!(status.remote_balance_after, 425);
 		assert_eq!(manager.list_events().len(), 4);
+	}
+
+	#[test]
+	fn live_claimed_asset_htlc_advances_native_receiver_balance() {
+		let store = store();
+		let manager = manager_with_store(true, Arc::clone(&store));
+		open_remote_funded_channel(&manager);
+		let payment_hash = nonzero(21);
+
+		manager
+			.record_live_inbound_payment_claimed(
+				payment_hash,
+				&[live_claimed_htlc(nonzero(4), 125)],
+			)
+			.unwrap();
+
+		let channels = manager.list_channels();
+		assert_eq!(channels[0].local_balance, 125);
+		assert_eq!(channels[0].remote_balance, 875);
+		assert_eq!(channels[0].latest_commitment_number, 1);
+
+		let payments = manager.list_payments();
+		assert_eq!(payments.len(), 1);
+		assert_eq!(payments[0].payment_id, hex_utils::to_string(&payment_hash));
+		assert_eq!(payments[0].direction, "remote_to_local");
+		assert_eq!(payments[0].asset_amount, 125);
+		assert_eq!(payments[0].local_balance_after, 125);
+		assert_eq!(payments[0].remote_balance_after, 875);
+
+		manager
+			.record_live_inbound_payment_claimed(
+				payment_hash,
+				&[live_claimed_htlc(nonzero(4), 125)],
+			)
+			.unwrap();
+		assert_eq!(manager.list_payments().len(), 1);
+
+		let reloaded = TaprootAssetManager::new(test_config(true), store);
+		assert_eq!(reloaded.list_channels()[0].local_balance, 125);
+		assert_eq!(reloaded.list_payments(), payments);
 	}
 
 	#[test]
