@@ -2151,6 +2151,7 @@ mod tests {
 	fn test_config(enabled: bool) -> ExperimentalChannelConfig {
 		ExperimentalChannelConfig {
 			negotiate_simple_taproot_channels: enabled,
+			negotiate_final_simple_taproot_channels: false,
 			negotiate_taproot_asset_channels: enabled,
 		}
 	}

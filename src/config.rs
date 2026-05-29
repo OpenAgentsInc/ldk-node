@@ -235,20 +235,36 @@ impl Default for Config {
 /// Experimental channel negotiation options for OpenAgentsInc fork-only demo paths.
 ///
 /// Defaults keep `ldk-node` BTC-only. Taproot Asset channels are layered on the BOLT simple
-/// taproot base, so enabling Taproot Asset channels without simple taproot support is invalid.
+/// taproot staging base, so enabling Taproot Asset channels without staging simple taproot support
+/// is invalid. Final BOLT simple-taproot negotiation is a separate production-mode switch.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ExperimentalChannelConfig {
-	/// Advertise and negotiate BOLT simple taproot channels for future channels.
+	/// Advertise and negotiate BOLT simple taproot staging channels for future channels.
 	pub negotiate_simple_taproot_channels: bool,
+	/// Advertise and negotiate final BOLT `option_simple_taproot` channels for future channels.
+	pub negotiate_final_simple_taproot_channels: bool,
 	/// Advertise and negotiate the experimental single-asset Taproot Asset channel overlay.
 	pub negotiate_taproot_asset_channels: bool,
 }
 
 impl ExperimentalChannelConfig {
-	/// Returns a config that enables both simple taproot and Taproot Asset channel negotiation.
+	/// Returns a config that enables staging simple taproot and Taproot Asset channel negotiation.
 	pub fn taproot_assets_regtest() -> Self {
-		Self { negotiate_simple_taproot_channels: true, negotiate_taproot_asset_channels: true }
+		Self {
+			negotiate_simple_taproot_channels: true,
+			negotiate_final_simple_taproot_channels: false,
+			negotiate_taproot_asset_channels: true,
+		}
+	}
+
+	/// Returns a config that enables final BOLT simple-taproot negotiation without asset overlay.
+	pub fn final_simple_taproot_regtest() -> Self {
+		Self {
+			negotiate_simple_taproot_channels: false,
+			negotiate_final_simple_taproot_channels: true,
+			negotiate_taproot_asset_channels: false,
+		}
 	}
 
 	pub(crate) fn is_valid(&self) -> bool {
@@ -436,6 +452,8 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 		config.anchor_channels_config.is_some();
 	user_config.channel_handshake_config.negotiate_simple_taproot_channels =
 		config.experimental_channel_config.negotiate_simple_taproot_channels;
+	user_config.channel_handshake_config.negotiate_final_simple_taproot_channels =
+		config.experimental_channel_config.negotiate_final_simple_taproot_channels;
 	user_config.channel_handshake_config.negotiate_taproot_asset_channels =
 		config.experimental_channel_config.negotiate_taproot_asset_channels;
 	user_config.reject_inbound_splices = false;
@@ -791,8 +809,10 @@ mod tests {
 		let user_config = default_user_config(&node_config);
 
 		assert!(!node_config.experimental_channel_config.negotiate_simple_taproot_channels);
+		assert!(!node_config.experimental_channel_config.negotiate_final_simple_taproot_channels);
 		assert!(!node_config.experimental_channel_config.negotiate_taproot_asset_channels);
 		assert!(!user_config.channel_handshake_config.negotiate_simple_taproot_channels);
+		assert!(!user_config.channel_handshake_config.negotiate_final_simple_taproot_channels);
 		assert!(!user_config.channel_handshake_config.negotiate_taproot_asset_channels);
 	}
 
@@ -804,7 +824,21 @@ mod tests {
 		let user_config = default_user_config(&node_config);
 
 		assert!(user_config.channel_handshake_config.negotiate_simple_taproot_channels);
+		assert!(!user_config.channel_handshake_config.negotiate_final_simple_taproot_channels);
 		assert!(user_config.channel_handshake_config.negotiate_taproot_asset_channels);
+		assert!(node_config.experimental_channel_config.is_valid());
+	}
+
+	#[test]
+	fn final_simple_taproot_config_maps_to_ldk_user_config() {
+		let mut node_config = Config::default();
+		node_config.experimental_channel_config =
+			ExperimentalChannelConfig::final_simple_taproot_regtest();
+		let user_config = default_user_config(&node_config);
+
+		assert!(!user_config.channel_handshake_config.negotiate_simple_taproot_channels);
+		assert!(user_config.channel_handshake_config.negotiate_final_simple_taproot_channels);
+		assert!(!user_config.channel_handshake_config.negotiate_taproot_asset_channels);
 		assert!(node_config.experimental_channel_config.is_valid());
 	}
 
@@ -812,6 +846,7 @@ mod tests {
 	fn taproot_asset_config_requires_simple_taproot() {
 		let config = ExperimentalChannelConfig {
 			negotiate_simple_taproot_channels: false,
+			negotiate_final_simple_taproot_channels: true,
 			negotiate_taproot_asset_channels: true,
 		};
 

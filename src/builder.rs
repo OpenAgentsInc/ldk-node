@@ -2244,6 +2244,7 @@ mod tests {
 		let mut config = Config::default();
 		config.experimental_channel_config = ExperimentalChannelConfig {
 			negotiate_simple_taproot_channels: false,
+			negotiate_final_simple_taproot_channels: false,
 			negotiate_taproot_asset_channels: true,
 		};
 		let builder = super::NodeBuilder::from_config(config);
